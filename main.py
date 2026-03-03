@@ -7,6 +7,8 @@ import re
 import random
 import string
 import html as _html_module
+import threading
+import concurrent.futures
 from urllib.parse import urljoin, urlparse, parse_qs, urlencode
 import requests
 from bs4 import BeautifulSoup
@@ -86,6 +88,9 @@ def _find_ca_bundle():
 
 CA_BUNDLE = _find_ca_bundle()
 
+_RESULTS_DIR = os.path.join(_SCRIPT_DIR, "results")
+os.makedirs(_RESULTS_DIR, exist_ok=True)
+
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
@@ -94,7 +99,8 @@ DB_FILE = "crawler.db"
 
 
 def get_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL")  # allow concurrent subprocess writes
     conn.execute(
         """CREATE TABLE IF NOT EXISTS pages (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -282,31 +288,63 @@ def analyze_url(url: str):
 # Crawler (main loop)
 # ---------------------------------------------------------------------------
 
-def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5):
+def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5, workers: int = 1):
     conn = get_db()
     add_url(conn, start_url)
+    _db_lock = threading.Lock()  # guards parent-side DB reads/claims
+
+    def _claim_next() -> str | None:
+        """Atomically grab and pre-mark one unvisited URL. Returns None if queue empty."""
+        with _db_lock:
+            while True:
+                row = conn.execute(
+                    "SELECT url FROM pages WHERE visited = 0 LIMIT 1"
+                ).fetchone()
+                if not row:
+                    return None
+                url = row[0]
+                # Pre-mark as visited so no other worker claims the same URL
+                conn.execute(
+                    "UPDATE pages SET visited = 1 WHERE canonical = ?",
+                    (canonical_url(url),),
+                )
+                conn.commit()
+                if stay_on_domain and not same_domain(start_url, url):
+                    continue  # already marked, skip silently
+                return url
+
+    def _run_worker(url: str):
+        subprocess.run(
+            [sys.executable, __file__, "--analyze", url],
+            capture_output=False,
+        )
+        time.sleep(delay)
+
+    if workers > 1:
+        print(C.cyan(f"[CRAWL]") + f" Starting with {C.bold(str(workers))} parallel workers")
 
     try:
-        while True:
-            # Pull next unvisited URL directly from DB – no in-memory queue
-            row = conn.execute(
-                "SELECT url FROM pages WHERE visited = 0 LIMIT 1"
-            ).fetchone()
-            if not row:
-                break
-            url = row[0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            pending: set[concurrent.futures.Future] = set()
 
-            if stay_on_domain and not same_domain(start_url, url):
-                mark_visited(conn, url)
-                continue
+            while True:
+                # Fill worker slots with freshly claimed URLs
+                while len(pending) < workers:
+                    url = _claim_next()
+                    if url is None:
+                        break
+                    pending.add(executor.submit(_run_worker, url))
 
-            # ---- spawn subprocess to analyze the URL -----------------------
-            subprocess.run(
-                [sys.executable, __file__, "--analyze", url],
-                capture_output=False,
-            )
+                if not pending:
+                    break  # nothing running and nothing left in DB
 
-            time.sleep(delay)
+                # Wait for at least one worker to finish (may have added new URLs)
+                done, pending = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                # Propagate any worker exceptions
+                for f in done:
+                    f.result()
 
     except KeyboardInterrupt:
         print(C.yellow("\n\n[INTERRUPTED]") + " Crawl stopped by user. Saving report…")
@@ -641,7 +679,7 @@ def run_xss_scan(start_url: str):
 # Helper: recrawl (reset DB for domain, then crawl)
 # ---------------------------------------------------------------------------
 
-def recrawl(start_url: str, stay_on_domain: bool = True):
+def recrawl(start_url: str, stay_on_domain: bool = True, workers: int = 1):
     """Delete all DB entries for start_url's domain, then crawl fresh."""
     conn = get_db()
     base_host = urlparse(start_url).netloc
@@ -659,7 +697,7 @@ def recrawl(start_url: str, stay_on_domain: bool = True):
     conn.close()
 
     print(C.yellow(f"[RECRAWL]") + f" Reset {len(ids_to_delete)} pages for {C.cyan(base_host)}")
-    crawl(start_url, stay_on_domain=stay_on_domain)
+    crawl(start_url, stay_on_domain=stay_on_domain, workers=workers)
 
 
 # ---------------------------------------------------------------------------
@@ -673,15 +711,17 @@ def show_help():
   python {prog} {C.cyan('<start_url>')} [options]
 
 {C.bold('Options:')}
-  {C.cyan('(none)')}          Crawl start_url, stay on same domain
-  {C.cyan('--all-domains')}   Follow links to other domains too
-  {C.cyan('--recrawl')}       Reset DB for start_url's domain and re-crawl
-  {C.cyan('--xss')}           Run reflected XSS tests on stored parameterised URLs
-  {C.cyan('--help')}          Show this help
+  {C.cyan('(none)')}            Crawl start_url, stay on same domain
+  {C.cyan('--all-domains')}     Follow links to other domains too
+  {C.cyan('--workers N')}       Fetch N pages in parallel (default: 1)
+  {C.cyan('--recrawl')}         Reset DB for start_url's domain and re-crawl
+  {C.cyan('--xss')}             Run reflected/stored XSS tests on stored URLs
+  {C.cyan('--help')}            Show this help
 
 {C.bold('Examples:')}
   python {prog} https://example.com
-  python {prog} https://example.com --recrawl
+  python {prog} https://example.com --workers 5
+  python {prog} https://example.com --recrawl --workers 8
   python {prog} https://example.com --xss
   python {prog} https://example.com --all-domains
 """)
@@ -712,20 +752,30 @@ if __name__ == "__main__":
 
     # Set up output tee → <domain>.txt
     domain_name = urlparse(start).netloc.replace(":", "_") or "output"
-    log_path = os.path.join(_SCRIPT_DIR, f"{domain_name}.txt")
+    log_path = os.path.join(_RESULTS_DIR, f"{domain_name}.txt")
     tee = _Tee(log_path)
     sys.stdout = tee
     print(f"[LOG] Output mirrored to {log_path}")
 
     stay = "--all-domains" not in args
 
+    # Parse --workers N (default 1)
+    workers = 1
+    if "--workers" in args:
+        idx = args.index("--workers")
+        try:
+            workers = max(1, int(args[idx + 1]))
+        except (IndexError, ValueError):
+            print(C.red("[ERROR]") + " --workers requires an integer argument")
+            sys.exit(1)
+
     try:
         if "--recrawl" in args:
-            recrawl(start, stay_on_domain=stay)
+            recrawl(start, stay_on_domain=stay, workers=workers)
         elif "--xss" in args:
             run_xss_scan(start)
         else:
-            crawl(start, stay_on_domain=stay)
+            crawl(start, stay_on_domain=stay, workers=workers)
     finally:
         sys.stdout = sys.__stdout__
         tee.close()
