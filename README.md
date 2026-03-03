@@ -10,9 +10,10 @@ A web crawler and XSS scanner written in Python. Crawls a target domain, discove
 - Discovers and records GET parameters from links
 - Deduplicates URLs by **parameter names** (not values) — `?name=A&age=B` and `?name=X&age=Y` count as the same URL, but `?name=A` and `?name=A&age=B` are different
 - Persists state in a local SQLite database (`crawler.db`) — interrupted crawls can be resumed
+- **Parallel crawling** via `--workers N` for faster coverage
 - XSS scanner with canary-based detection, HTML context analysis, and stored XSS detection
 - Colour-coded terminal output
-- All output is simultaneously saved to `<domain>.txt` (ANSI codes stripped)
+- All output is simultaneously saved to `results/<domain>.txt` (ANSI codes stripped)
 - Skips non-HTML content (videos, PDFs, etc.) automatically
 
 ---
@@ -56,6 +57,7 @@ python main.py <start_url> [options]
 |---|---|
 | *(none)* | Crawl `start_url`, stay on same domain |
 | `--all-domains` | Follow links to other domains too |
+| `--workers N` | Fetch N pages in parallel (default: 1) |
 | `--recrawl` | Reset DB entries for the domain and re-crawl from scratch |
 | `--xss` | Run XSS scan against previously crawled parameterised URLs |
 | `--help` | Show usage |
@@ -66,11 +68,14 @@ python main.py <start_url> [options]
 # Basic crawl
 python main.py https://example.com
 
+# Crawl with 5 parallel workers
+python main.py https://example.com --workers 5
+
 # Crawl and follow all external links
 python main.py https://example.com --all-domains
 
-# Wipe previous data and re-crawl
-python main.py https://example.com --recrawl
+# Wipe previous data and re-crawl (with 8 workers)
+python main.py https://example.com --recrawl --workers 8
 
 # Run XSS scan after crawling
 python main.py https://example.com --xss
@@ -83,12 +88,18 @@ python main.py https://example.com --xss
 ### Crawling
 
 1. The start URL is added to the SQLite database
-2. The main loop picks the next unvisited URL from the DB and spawns a subprocess to analyze it
-3. The subprocess fetches the page, extracts all `<a href>` links, saves new URLs to the DB, and records any GET parameters found
-4. The loop ends when no unvisited URLs remain
+2. The main loop claims unvisited URLs from the DB and dispatches them to a pool of worker threads
+3. Each worker spawns a subprocess that fetches the page, extracts all `<a href>` links, saves new URLs to the DB, and records any GET parameters found
+4. The loop ends when no unvisited URLs remain and all workers are idle
 5. A final report is printed (and written to file)
 
 State is stored in `crawler.db`. If you press **Ctrl+C**, the crawl stops cleanly and prints a report of everything collected so far. The next run will resume from where it left off. Use `--recrawl` to start fresh.
+
+### Parallel Workers
+
+`--workers N` runs N subprocesses concurrently. The main thread is the sole DB reader/claimer — it atomically pre-marks each URL as visited before dispatching it, so no two workers ever fetch the same page. SQLite WAL mode allows all subprocesses to write new URLs to the DB simultaneously without blocking each other.
+
+Recommended values: `--workers 4` to `--workers 10`. Higher values may trigger rate-limiting on the target server.
 
 ### URL Deduplication
 
@@ -142,9 +153,11 @@ After all injections, every previously visited page is re-fetched. If the canary
 
 ## Output
 
-All output is written to the terminal in colour and simultaneously appended to `<domain>.txt` (colour codes stripped) in the script directory.
+All output is written to the terminal in colour and simultaneously appended to `results/<domain>.txt` (colour codes stripped). The `results/` directory is created automatically next to `main.py`.
 
-Example log file: `www.example.com.txt`
+Example log file: `results/www.example.com.txt`
+
+Both the crawl report and XSS scan report are included in the same file. Pressing **Ctrl+C** during either phase still produces a partial report.
 
 ---
 
