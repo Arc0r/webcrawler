@@ -58,9 +58,31 @@ python main.py <start_url> [options]
 | *(none)* | Crawl `start_url`, stay on same domain |
 | `--all-domains` | Follow links to other domains too |
 | `--workers N` | Fetch N pages in parallel (default: 1) |
+| `--ignore PATTERN` | Skip URLs matching a substring, glob, or `param:NAME` (repeatable) |
 | `--recrawl` | Reset DB entries for the domain and re-crawl from scratch |
 | `--xss` | Run XSS scan against previously crawled parameterised URLs |
 | `--help` | Show usage |
+
+### `--ignore` patterns
+
+`--ignore` can be specified multiple times. Each pattern is matched against the full URL:
+
+| Pattern | Behaviour |
+|---|---|
+| `/logout` | Skips any URL whose string contains `/logout` |
+| `*/admin/*` | Skips URLs matching the glob pattern |
+| `param:NAME` | Skips any URL that has a query parameter named `NAME` (regardless of value) |
+
+```bash
+# Skip /logout and /print pages
+python main.py https://example.com --ignore /logout --ignore /print
+
+# Skip any URL with a "session" or "token" query parameter
+python main.py https://example.com --ignore param:session --ignore param:token
+
+# Combine URL and parameter patterns
+python main.py https://example.com --ignore /admin --ignore param:debug
+```
 
 ### Examples
 
@@ -148,6 +170,10 @@ Plus **2 raw payloads** from `/usr/share/wordlists/xss.txt` (verbatim exact-matc
 #### Phase 2 — Stored XSS
 
 After all injections, every previously visited page is re-fetched. If the canary appears on a page that was not the injection target, it indicates stored XSS (the payload was saved server-side and rendered elsewhere).
+
+#### Vulnerability Summary
+
+At the end of every XSS scan a consolidated **SUMMARY** block is printed. Each exploitable finding — reflected or stored — gets a numbered entry with its type, affected parameter, injection context, and a ready-to-use test URL. If nothing exploitable was found, a single green confirmation line is shown instead.
 
 ---
 

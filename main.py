@@ -800,6 +800,30 @@ def run_xss_scan(start_url: str):
     print()
     print(sep)
 
+    # ── Consolidated vulnerability summary ───────────────────────────────────
+    total_vulns = len(exploitable) + len(stored_hits)
+    print()
+    print(C.bold("=" * 60))
+    if total_vulns == 0:
+        print(C.green(C.bold("  SUMMARY: No exploitable XSS vulnerabilities found.")))
+    else:
+        print(C.red(C.bold(f"  SUMMARY: {total_vulns} EXPLOITABLE VULNERABILITY/IES FOUND")))
+        print()
+        idx = 1
+        if exploitable:
+            print(C.bold("  Reflected XSS:"))
+            for url, param, label, desc, test_url in exploitable:
+                print(f"    {idx}. {C.red('REFLECTED')}  param={C.yellow(param)}  [{label}]")
+                print(f"       Context  : {desc}")
+                print(f"       Test URL : {C.magenta(test_url)}")
+                idx += 1
+        if stored_hits:
+            print(C.bold("  Stored XSS:"))
+            for page_url in stored_hits:
+                print(f"    {idx}. {C.red('STORED')}  {C.cyan(page_url)}")
+                idx += 1
+    print(C.bold("=" * 60))
+
 
 # ---------------------------------------------------------------------------
 # Helper: recrawl (reset DB for domain, then crawl)
