@@ -61,6 +61,7 @@ python main.py <start_url> [options]
 | `--ignore PATTERN` | Skip URLs matching a substring, glob, or `param:NAME` (repeatable) |
 | `--recrawl` | Reset DB entries for the domain and re-crawl from scratch |
 | `--xss` | Run XSS scan against previously crawled parameterised URLs |
+| `--advancedscan URL [param]` | Run the full `xss.txt` wordlist + built-in payloads against a single URL; no crawl required |
 | `--help` | Show usage |
 
 ### `--ignore` patterns
@@ -101,6 +102,12 @@ python main.py https://example.com --recrawl --workers 8
 
 # Run XSS scan after crawling
 python main.py https://example.com --xss
+
+# Targeted advanced scan on a single URL (all parameters)
+python main.py --advancedscan "http://example.com/search.php?q=test"
+
+# Same, but only test the "q" parameter
+python main.py --advancedscan "http://example.com/search.php?q=test" q
 ```
 
 ---
@@ -154,9 +161,9 @@ For each parameterised URL found during crawling, injects payloads into each GET
 | 4 | `"><img src=x onerror=alert('canary')>` — attribute breakout |
 | 5 | `';alert('canary');//` — JavaScript string breakout |
 
-Plus **2 raw payloads** from `/usr/share/wordlists/xss.txt` (verbatim exact-match check).
+Plus **2 evenly-sampled payloads** from `/usr/share/wordlists/xss.txt` (verbatim, subjected to context analysis — see below).
 
-**Context analysis** — when a reflection is found, the response is parsed to determine *where* the canary landed:
+**Context analysis** — when a reflection is found, the response is parsed to determine *where* the canary (or verbatim payload) landed and whether it could realistically execute:
 
 | Context | Assessment |
 |---|---|
@@ -167,9 +174,33 @@ Plus **2 raw payloads** from `/usr/share/wordlists/xss.txt` (verbatim exact-matc
 | URL-encoded (`%3C`, `%3E`) | Filtered |
 | Raw in body (no special context) | Exploitable |
 
+All 5 built-in payloads are **always tested**, even after an earlier payload already reflected. This ensures that e.g. the `<script>` payload is explicitly verified and not silently skipped because the raw canary reflected first.
+
 #### Phase 2 — Stored XSS
 
 After all injections, every previously visited page is re-fetched. If the canary appears on a page that was not the injection target, it indicates stored XSS (the payload was saved server-side and rendered elsewhere).
+
+---
+
+### Advanced Scan (`--advancedscan`)
+
+Runs **every** payload from `/usr/share/wordlists/xss.txt` plus the 5 built-in canary payloads against a single URL and, optionally, a single named parameter. No prior crawl or database entry is required.
+
+```bash
+# Test all parameters in the URL
+python main.py --advancedscan "http://example.com/vuln.php?name=foo&age=1"
+
+# Test only the "name" parameter
+python main.py --advancedscan "http://example.com/vuln.php?name=foo&age=1" name
+```
+
+Useful when you already know which page and parameter you want to probe (e.g. from manual reconnaissance) and do not want to crawl an entire site.
+
+- Wordlist payloads are analysed with the same context engine as the built-in payloads — `<script>` tags, event handlers (`onerror=`, `onload=`, …), and `javascript:` URIs are flagged as exploitable; entity-encoded reflections are flagged as filtered.
+- A progress summary `(N reflected, M safe)` is printed after the wordlist phase.
+- The final report lists all exploitable hits with their injection context and a ready-to-use test URL.
+
+---
 
 #### Vulnerability Summary
 

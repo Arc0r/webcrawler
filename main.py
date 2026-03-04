@@ -619,6 +619,201 @@ def _check_reflection_context(html_text: str, canary: str, payload: str = "") ->
     return results
 
 
+def _check_xss_context(html_text: str, payload: str) -> list[tuple[str, bool]]:
+    """
+    Determine whether a verbatim-reflected wordlist payload (no separate canary)
+    is in an executable context.
+
+    Returns a list of (description, exploitable) tuples, same as
+    _check_reflection_context.
+    """
+    esc = _html_module.escape(payload)
+    if esc in html_text and payload not in html_text:
+        return [("HTML-entity encoded – filtered (not exploitable)", False)]
+    if payload not in html_text:
+        url_enc = payload.replace("<", "%3C").replace(">", "%3E").replace('"', "%22")
+        if url_enc.lower() in html_text.lower():
+            return [("URL-encoded reflection – filtered (not exploitable)", False)]
+        return []
+
+    pl = payload.lower()
+
+    # script tag injected
+    if "<script" in pl:
+        soup = BeautifulSoup(html_text, "html.parser")
+        for script in soup.find_all("script"):
+            if not script.get("src") and payload[:30] in (script.string or ""):
+                return [("payload inside <script> block – JS execution likely", True)]
+        # script present in raw HTML and not entity-encoded
+        if "<script" in html_text.lower():
+            return [("<script> tag reflected unescaped – JS execution likely", True)]
+
+    # event handler attributes
+    for ev in ("onerror", "onload", "onclick", "onmouseover", "onfocus"):
+        if f"{ev}=" in pl and f"{ev}=" in html_text.lower():
+            return [(f"event handler ({ev}=) reflected unescaped – JS execution likely", True)]
+
+    # javascript: URI
+    if "javascript:" in pl and "javascript:" in html_text.lower():
+        return [("javascript: URI reflected – JS execution possible", True)]
+
+    # < and > are unescaped but no obviously executable pattern
+    if "<" in payload and "<" in html_text:
+        return [("HTML tag reflected unescaped (< not filtered) – potential HTML injection", True)]
+
+    return [("verbatim reflection – no executable pattern detected", False)]
+
+
+def run_advanced_scan(url: str, param: str | None = None):
+    """
+    Run ALL payloads from xss.txt plus the built-in canary suite against a
+    single URL (and optionally a single named parameter).
+    No DB / crawl required – call directly with the target URL.
+
+    Example:
+      python main.py --advancedscan "http://localhost/xss.php?test=foo"
+      python main.py --advancedscan "http://localhost/xss.php?test=foo" test
+    """
+    canary = "xsstest" + "".join(random.choices(string.ascii_lowercase, k=6))
+
+    built_in_payloads: list[tuple[str, str]] = [
+        (canary,                                                    "1-raw canary"),
+        (f"<{canary}>",                                             "2-HTML tag"),
+        (f"<script>alert('{canary}')</script>",                     "3-script tag"),
+        (f'"><img src=x onerror=alert(\'{canary}\')>',              "4-attribute breakout"),
+        (f"';alert('{canary}');//",                                 "5-JS string breakout"),
+    ]
+
+    # Load ALL wordlist payloads
+    wordlist_payloads: list[str] = []
+    try:
+        with open(XSS_WORDLIST, encoding="utf-8", errors="ignore") as f:
+            wordlist_payloads = [ln.strip() for ln in f if ln.strip()]
+    except FileNotFoundError:
+        print(C.yellow(f"[WARNING] Wordlist {XSS_WORDLIST} not found – only built-in payloads will be used"))
+
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    if not params:
+        print(C.red("[ERROR] No query parameters found in URL."))
+        print(C.yellow("  Add the parameter you want to test, e.g.:  ?test=foo"))
+        return
+
+    # Which parameters to test
+    if param:
+        if param not in params:
+            print(C.yellow(f"[WARNING] Parameter '{param}' not in URL; testing all params: {list(params.keys())}"))
+            test_params_list = list(params.keys())
+        else:
+            test_params_list = [param]
+    else:
+        test_params_list = list(params.keys())
+
+    HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}
+    total_tests = (len(built_in_payloads) + len(wordlist_payloads)) * len(test_params_list)
+
+    sep = C.bold("=" * 60)
+    print(f"\n{sep}")
+    print(C.bold("ADVANCED XSS SCAN"))
+    print(sep)
+    print(f"  Target URL        : {C.cyan(url)}")
+    print(f"  Parameters tested : {C.yellow(', '.join(test_params_list))}")
+    print(f"  Canary token      : {C.magenta(canary)}")
+    print(f"  Built-in payloads : {len(built_in_payloads)}")
+    print(f"  Wordlist payloads : {len(wordlist_payloads)}  (from {XSS_WORDLIST})")
+    print(f"  Total tests       : {C.bold(str(total_tests))}")
+    print()
+
+    # (test_param, label, exploitable, description, test_url)
+    all_hits: list[tuple[str, str, bool, str, str]] = []
+
+    try:
+        for test_param in test_params_list:
+            print(C.bold(f"--- Parameter: {test_param} ---"))
+
+            # ── built-in canary payloads ──────────────────────────────────────
+            for payload, label in built_in_payloads:
+                test_p = {k: v[0] for k, v in params.items()}
+                test_p[test_param] = payload
+                test_url = parsed._replace(query=urlencode(test_p)).geturl()
+                try:
+                    resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
+                                        headers=HEADERS, allow_redirects=True)
+                    contexts = _check_reflection_context(resp.text, canary, payload)
+                    if not contexts:
+                        print(C.green("  [safe]") + f" [{label}]")
+                    else:
+                        for desc, exploitable in contexts:
+                            icon = C.red("[VULNERABLE]") if exploitable else C.yellow("[FILTERED]")
+                            print(f"  {icon} [{label}]")
+                            print(f"    Context  : {desc}")
+                            print(f"    Payload  : {payload[:120]}")
+                            if exploitable:
+                                print(f"    Test URL : {C.magenta(test_url)}")
+                            all_hits.append((test_param, label, exploitable, desc, test_url))
+                except Exception as exc:
+                    print(C.red("  [ERROR]") + f" [{label}] {exc}")
+
+            # ── wordlist payloads ─────────────────────────────────────────────
+            if wordlist_payloads:
+                print(C.bold(f"  Running {len(wordlist_payloads)} wordlist payloads … (press Ctrl-C to stop early)"))
+            vuln_count = 0
+            safe_count = 0
+            for i, payload in enumerate(wordlist_payloads, 1):
+                test_p = {k: v[0] for k, v in params.items()}
+                test_p[test_param] = payload
+                test_url = parsed._replace(query=urlencode(test_p)).geturl()
+                try:
+                    resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
+                                        headers=HEADERS, allow_redirects=True)
+                    if payload in resp.text:
+                        contexts = _check_xss_context(resp.text, payload)
+                        for desc, exploitable in contexts:
+                            icon = C.red("[VULNERABLE]") if exploitable else C.yellow("[REFLECTED]")
+                            print(f"  {icon} [wordlist #{i}] {payload[:70]}")
+                            print(f"    Context  : {desc}")
+                            if exploitable:
+                                print(f"    Test URL : {C.magenta(test_url)}")
+                            all_hits.append((test_param, f"wordlist#{i}", exploitable, desc, test_url))
+                            vuln_count += 1
+                    else:
+                        safe_count += 1
+                except Exception as exc:
+                    print(C.red("  [ERROR]") + f" [wordlist #{i}] {exc}")
+            if wordlist_payloads:
+                print(f"  [wordlist done] {C.red(str(vuln_count))} reflected, {C.green(str(safe_count))} safe")
+
+    except KeyboardInterrupt:
+        print(C.yellow("\n\n[INTERRUPTED]") + " Advanced scan stopped by user. Printing partial report…")
+
+    # ── Report ────────────────────────────────────────────────────────────────
+    exploitable = [(p, l, d, tu) for p, l, ex, d, tu in all_hits if ex]
+    filtered    = [(p, l, d, tu) for p, l, ex, d, tu in all_hits if not ex]
+
+    print(f"\n{sep}")
+    print(C.bold("ADVANCED XSS SCAN REPORT"))
+    print(sep)
+    print(f"  Canary : {C.magenta(canary)}")
+    print()
+    if not all_hits:
+        print(C.green("  No XSS reflections detected."))
+    else:
+        if exploitable:
+            print(C.red(C.bold(f"  {len(exploitable)} EXPLOITABLE reflection(s) found!")))
+            for prm, label, desc, test_url in exploitable:
+                print(f"    {C.red('VULNERABLE')} param={C.yellow(prm)} [{label}]")
+                print(f"      Context  : {desc}")
+                print(f"      Test URL : {C.magenta(test_url)}")
+        else:
+            print(C.green("  No exploitable XSS found."))
+        if filtered:
+            print(C.yellow(f"\n  {len(filtered)} filtered/encoded reflection(s) – output is escaped:"))
+            for prm, label, desc, _ in filtered:
+                print(f"    param={prm} [{label}] – {desc}")
+    print()
+    print(C.bold("=" * 60))
+
+
 def run_xss_scan(start_url: str):
     """Test all known parameterised URLs for reflected and stored XSS."""
     # ---- unique per-scan canary so we can detect partial/mangled reflection --
@@ -686,10 +881,10 @@ def run_xss_scan(start_url: str):
             for param in params:
                 param_hit = False
 
-                # Built-in canary payloads
+                # Built-in canary payloads – always run ALL payloads so that
+                # e.g. <script> execution is verified even if the raw canary
+                # already reflected.
                 for payload, label in built_in_payloads:
-                    if param_hit:
-                        break
                     test_params = {k: v[0] for k, v in params.items()}
                     test_params[param] = payload
                     test_url = parsed._replace(query=urlencode(test_params)).geturl()
@@ -726,11 +921,18 @@ def run_xss_scan(start_url: str):
                         resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
                                             headers=HEADERS, allow_redirects=True)
                         if payload in resp.text:
-                            print(C.red("  [VULNERABLE]") + f" param={C.yellow(param)} [wordlist] verbatim reflected")
-                            print(f"    Payload  : {payload[:80]}")
-                            print(f"    Test URL : {C.magenta(test_url)}")
-                            reflected_hits.append((base_url, param, "wordlist", "verbatim reflection", True, test_url))
-                            param_hit = True
+                            contexts = _check_xss_context(resp.text, payload)
+                            for desc, exploitable in contexts:
+                                icon = C.red("[VULNERABLE]") if exploitable else C.yellow("[REFLECTED]")
+                                print(f"  {icon} param={C.yellow(param)} [wordlist]")
+                                print(f"    Payload  : {payload[:80]}")
+                                print(f"    Context  : {desc}")
+                                if exploitable:
+                                    print(f"    Test URL : {C.magenta(test_url)}")
+                                    reflected_hits.append((base_url, param, "wordlist", desc, True, test_url))
+                                    param_hit = True
+                                else:
+                                    reflected_hits.append((base_url, param, "wordlist", desc, False, test_url))
                         else:
                             print(C.green("  [safe]") + f" param={param} [wordlist]")
                     except Exception as exc:
@@ -867,6 +1069,7 @@ def show_help():
   {C.cyan('--ignore PATTERN')}    Skip URLs matching PATTERN (substring or glob, repeatable)
   {C.cyan('--recrawl')}           Reset DB for start_url's domain and re-crawl
   {C.cyan('--xss')}               Run reflected/stored XSS tests on stored URLs
+  {C.cyan('--advancedscan URL')}  Run ALL xss.txt payloads on URL (+ optional param name)
   {C.cyan('--help')}              Show this help
 
 {C.bold('--ignore examples:')}
@@ -883,6 +1086,8 @@ def show_help():
   python {prog} https://example.com --recrawl --workers 8
   python {prog} https://example.com --xss
   python {prog} https://example.com --all-domains
+  python {prog} --advancedscan "http://localhost/xss.php?test=foo"
+  python {prog} --advancedscan "http://localhost/xss.php?test=foo" test
 """)
 
 
@@ -942,6 +1147,20 @@ if __name__ == "__main__":
             recrawl(start, stay_on_domain=stay, workers=workers)
         elif "--xss" in args:
             run_xss_scan(start)
+        elif "--advancedscan" in args:
+            adv_idx = args.index("--advancedscan")
+            # URL: next arg after --advancedscan if it looks like a URL, else use start
+            _next = args[adv_idx + 1] if adv_idx + 1 < len(args) else ""
+            if _next.startswith("http"):
+                adv_url = _next
+                # Optional param name immediately after the URL
+                _after = args[adv_idx + 2] if adv_idx + 2 < len(args) else ""
+                adv_param: str | None = _after if _after and not _after.startswith("--") else None
+            else:
+                # URL given as the positional start arg; treat _next as param name
+                adv_url = start
+                adv_param = _next if _next and not _next.startswith("--") else None
+            run_advanced_scan(adv_url, adv_param)
         else:
             crawl(start, stay_on_domain=stay, workers=workers)
     finally:
