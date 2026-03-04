@@ -15,6 +15,9 @@ A web crawler and XSS scanner written in Python. Crawls a target domain, discove
 - Colour-coded terminal output
 - All output is simultaneously saved to `results/<domain>.txt` (ANSI codes stripped)
 - Skips non-HTML content (videos, PDFs, etc.) automatically
+- **HTML Crawl Report** generated automatically after every crawl (`results/<domain>_crawl_report.html`)
+- **HTML XSS Report** generated automatically after every XSS scan (`results/<domain>_xss_report.html`)
+- Reports feature collapsible sections per finding category, dark-themed UI
 
 ---
 
@@ -212,9 +215,40 @@ At the end of every XSS scan a consolidated **SUMMARY** block is printed. Each e
 
 All output is written to the terminal in colour and simultaneously appended to `results/<domain>.txt` (colour codes stripped). The `results/` directory is created automatically next to `main.py`.
 
-Example log file: `results/www.example.com.txt`
+### Files produced
 
-Both the crawl report and XSS scan report are included in the same file. Pressing **Ctrl+C** during either phase still produces a partial report.
+| File | When created | Description |
+|---|---|---|
+| `results/<domain>.txt` | Every run | Full terminal log (ANSI codes stripped) |
+| `results/<domain>_crawl_report.html` | After every crawl | Interactive HTML crawl report |
+| `results/<domain>_xss_report.html` | After every `--xss` scan | Interactive HTML XSS report |
+
+Pressing **Ctrl+C** during either phase still produces a partial report in all three files.
+
+### HTML Crawl Report
+
+A self-contained dark-themed HTML file with **collapsible sections** per finding category:
+
+| Section | Contents |
+|---|---|
+| 🔴 404 Not Found | URLs that returned HTTP 404 |
+| 🟡 403 Forbidden | URLs that returned HTTP 403 |
+| ⚠️ Other HTTP Errors | Any other 4xx/5xx responses |
+| 🎞️ Media / Non-HTML (skipped) | URLs skipped due to non-HTML content type |
+| ❌ Fetch Errors | URLs that could not be reached |
+| 🔗 External Links | Links pointing outside the crawled domain |
+| 🔍 URLs with GET Parameters | Parameterised URLs with their parameter names/values |
+| ✅ Successfully Crawled Pages | All pages that returned HTTP 200 HTML |
+
+### HTML XSS Report
+
+A self-contained dark-themed HTML file with **collapsible sections**:
+
+| Section | Contents |
+|---|---|
+| 🔴 Exploitable Reflected XSS | Vulnerabilities grouped by URL, with injection context and test URL |
+| 💾 Stored XSS | Pages where the canary was found after injection |
+| 🟡 Filtered / Encoded Reflections | Reflections that are HTML/URL-encoded by the server |
 
 ---
 

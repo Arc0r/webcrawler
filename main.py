@@ -103,10 +103,12 @@ def get_db():
     conn.execute("PRAGMA journal_mode=WAL")  # allow concurrent subprocess writes
     conn.execute(
         """CREATE TABLE IF NOT EXISTS pages (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            url       TEXT    NOT NULL,
-            canonical TEXT    UNIQUE NOT NULL,
-            visited   INTEGER NOT NULL DEFAULT 0
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            url         TEXT    NOT NULL,
+            canonical   TEXT    UNIQUE NOT NULL,
+            visited     INTEGER NOT NULL DEFAULT 0,
+            status_code INTEGER NOT NULL DEFAULT 0,
+            skip_reason TEXT    NOT NULL DEFAULT ''
         )"""
     )
     conn.execute(
@@ -130,6 +132,10 @@ def get_db():
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_canonical ON pages (canonical)"
         )
+    if "status_code" not in cols:
+        conn.execute("ALTER TABLE pages ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0")
+    if "skip_reason" not in cols:
+        conn.execute("ALTER TABLE pages ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''")
     conn.commit()
     return conn
 
@@ -167,6 +173,15 @@ def save_finding(conn: sqlite3.Connection, url: str, param: str, value: str):
     conn.execute(
         "INSERT INTO findings (url, param, value) VALUES (?, ?, ?)",
         (url, param, value),
+    )
+    conn.commit()
+
+
+def set_page_status(conn: sqlite3.Connection, url: str, status_code: int, skip_reason: str = ""):
+    """Record the HTTP status code and optional skip reason for a page."""
+    conn.execute(
+        "UPDATE pages SET status_code = ?, skip_reason = ? WHERE canonical = ?",
+        (status_code, skip_reason, canonical_url(url)),
     )
     conn.commit()
 
@@ -291,16 +306,30 @@ def analyze_url(url: str):
     # ---- fetch page --------------------------------------------------------
     try:
         resp = requests.get(url, timeout=10, verify=CA_BUNDLE, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"})
-        resp.raise_for_status()
-        content_type = resp.headers.get("Content-Type", "")
-        if "html" not in content_type:
-            print(f"  [SKIP] Non-HTML content ({content_type.split(';')[0].strip()})")
+        try:
+            resp.raise_for_status()
+        except requests.exceptions.HTTPError as http_err:
+            status = resp.status_code
+            print(C.red(f"  [HTTP {status}]") + f" {url}")
+            set_page_status(conn, url, status)
             mark_visited(conn, url)
             conn.close()
             return
+        content_type = resp.headers.get("Content-Type", "")
+        if "html" not in content_type:
+            ct_short = content_type.split(";")[0].strip()
+            print(f"  [SKIP] Non-HTML content ({ct_short})")
+            set_page_status(conn, url, resp.status_code, f"media:{ct_short}")
+            mark_visited(conn, url)
+            conn.close()
+            return
+        set_page_status(conn, url, resp.status_code)
         html = resp.text
+    except requests.exceptions.HTTPError:
+        pass  # handled above
     except Exception as exc:
         print(C.red(f"  [ERROR]") + f" Could not fetch {url}: {exc}")
+        set_page_status(conn, url, 0, f"error:{exc}")
         mark_visited(conn, url)
         conn.close()
         return
@@ -403,6 +432,293 @@ def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5, worke
 # Reporting
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# HTML Crawl Report
+# ---------------------------------------------------------------------------
+
+_HTML_STYLE = """
+<style>
+  :root {
+    --bg: #0d1117; --surface: #161b22; --border: #30363d;
+    --text: #c9d1d9; --muted: #8b949e;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --blue: #58a6ff; --purple: #bc8cff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', system-ui, sans-serif; padding: 2rem; }
+  h1 { color: var(--blue); font-size: 1.8rem; margin-bottom: 0.25rem; }
+  .subtitle { color: var(--muted); margin-bottom: 2rem; font-size: 0.9rem; }
+  .stats-grid { display: flex; flex-wrap: wrap; gap: 1rem; margin-bottom: 2rem; }
+  .stat-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+                padding: 1rem 1.5rem; min-width: 160px; }
+  .stat-card .label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat-card .value { font-size: 1.8rem; font-weight: bold; margin-top: 0.2rem; }
+  .value.green { color: var(--green); } .value.yellow { color: var(--yellow); }
+  .value.red { color: var(--red); } .value.blue { color: var(--blue); }
+  details { margin: 0.75rem 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+  summary { padding: 0.8rem 1.2rem; cursor: pointer; background: var(--surface);
+             display: flex; align-items: center; gap: 0.6rem; font-weight: 600;
+             list-style: none; user-select: none; }
+  summary::-webkit-details-marker { display: none; }
+  summary::before { content: '▶'; font-size: 0.7rem; transition: transform 0.2s; color: var(--muted); }
+  details[open] summary::before { transform: rotate(90deg); }
+  summary .badge { margin-left: auto; background: var(--border); border-radius: 999px;
+                   padding: 0.15rem 0.6rem; font-size: 0.75rem; font-weight: 700; }
+  summary.red   { border-left: 4px solid var(--red); }    summary.red .badge   { background: var(--red); color: #fff; }
+  summary.yellow{ border-left: 4px solid var(--yellow); } summary.yellow .badge{ background: var(--yellow); color: #000; }
+  summary.green { border-left: 4px solid var(--green); }  summary.green .badge { background: var(--green); color: #000; }
+  summary.blue  { border-left: 4px solid var(--blue); }   summary.blue .badge  { background: var(--blue); color: #000; }
+  summary.muted { border-left: 4px solid var(--muted); }
+  .detail-body { padding: 0.5rem 1.2rem 1rem; background: var(--bg); }
+  .url-list { list-style: none; }
+  .url-list li { padding: 0.35rem 0; border-bottom: 1px solid var(--border); font-size: 0.85rem;
+                  display: flex; flex-direction: column; gap: 0.1rem; word-break: break-all; }
+  .url-list li:last-child { border-bottom: none; }
+  a { color: var(--blue); text-decoration: none; } a:hover { text-decoration: underline; }
+  .tag { display: inline-block; font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 4px;
+          font-weight: 600; margin-right: 0.3rem; }
+  .tag.red    { background: rgba(248,81,73,0.2); color: var(--red); }
+  .tag.yellow { background: rgba(210,153,34,0.2); color: var(--yellow); }
+  .tag.green  { background: rgba(63,185,80,0.2);  color: var(--green); }
+  .tag.blue   { background: rgba(88,166,255,0.2); color: var(--blue); }
+  .tag.muted  { background: rgba(139,148,158,0.2); color: var(--muted); }
+  .param-row { color: var(--purple); font-size: 0.8rem; }
+  .empty { color: var(--muted); font-style: italic; padding: 0.5rem 0; }
+  .xss-block { padding: 0.6rem; margin: 0.4rem 0; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); }
+  .xss-block .ctx  { font-size: 0.8rem; color: var(--muted); margin-top: 0.3rem; }
+  .xss-block .turl { font-size: 0.78rem; color: var(--blue); margin-top: 0.2rem; word-break: break-all; }
+</style>
+"""
+
+def _html_section(title: str, items: list[str], color: str = "muted", open_by_default: bool = False) -> str:
+    """Render a collapsible <details> section with an <ul> of raw HTML item strings."""
+    open_attr = " open" if open_by_default else ""
+    badge = f'<span class="badge">{len(items)}</span>'
+    header = f'<summary class="{color}">{title}{badge}</summary>'
+    if not items:
+        body = '<div class="detail-body"><p class="empty">None found.</p></div>'
+    else:
+        rows = "\n".join(f"<li>{item}</li>" for item in items)
+        body = f'<div class="detail-body"><ul class="url-list">{rows}</ul></div>'
+    return f"<details{open_attr}>{header}{body}</details>"
+
+
+def generate_crawl_report_html(start_url: str, out_path: str):
+    """Query the DB and write a self-contained HTML crawl report to *out_path*."""
+    import datetime
+    conn = get_db()
+    base_host = urlparse(start_url).netloc if start_url else ""
+
+    all_pages = conn.execute(
+        "SELECT url, visited, status_code, skip_reason FROM pages ORDER BY url"
+    ).fetchall()
+    findings = conn.execute(
+        "SELECT url, param, value FROM findings ORDER BY url, param"
+    ).fetchall()
+    conn.close()
+
+    # Partition pages
+    pages_404, pages_403, pages_other_err, pages_media, pages_error = [], [], [], [], []
+    pages_ok, pages_external = [], []
+
+    for url, visited, status_code, skip_reason in all_pages:
+        is_internal = not base_host or urlparse(url).netloc == base_host
+        if not is_internal:
+            pages_external.append(url)
+            continue
+        if status_code == 404:
+            pages_404.append(url)
+        elif status_code == 403:
+            pages_403.append(url)
+        elif status_code and status_code >= 400:
+            pages_other_err.append((url, status_code))
+        elif skip_reason.startswith("media:"):
+            ct = skip_reason[len("media:"):]
+            pages_media.append((url, ct))
+        elif skip_reason.startswith("error:"):
+            pages_error.append((url, skip_reason[len("error:"):]))
+        elif visited:
+            pages_ok.append(url)
+
+    # GET-param findings grouped by URL
+    params_by_url: dict[str, list[tuple[str, str]]] = {}
+    for url, param, value in findings:
+        if not base_host or urlparse(url).netloc == base_host:
+            params_by_url.setdefault(url, []).append((param, value))
+
+    total_crawled = len(pages_ok) + len(pages_404) + len(pages_403) + len(pages_other_err) + len(pages_media) + len(pages_error)
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ── Build section items ────────────────────────────────────────────────
+    def _url_link(u: str) -> str:
+        safe = _html_module.escape(u)
+        return f'<a href="{safe}" target="_blank">{safe}</a>'
+
+    items_404   = [_url_link(u) for u in pages_404]
+    items_403   = [_url_link(u) for u in pages_403]
+    items_other = [f'<span class="tag red">HTTP {sc}</span>{_url_link(u)}' for u, sc in pages_other_err]
+    items_media = [f'<span class="tag muted">{_html_module.escape(ct)}</span>{_url_link(u)}' for u, ct in pages_media]
+    items_error = [f'<span class="tag red">error</span>{_url_link(u)}<span class="param-row">{_html_module.escape(e[:120])}</span>' for u, e in pages_error]
+    items_ext   = [_url_link(u) for u in sorted(set(pages_external))]
+    items_ok    = [_url_link(u) for u in pages_ok]
+
+    # GET param items: one collapsible entry per URL
+    param_items = []
+    for url, param_list in sorted(params_by_url.items()):
+        params_html = " ".join(
+            f'<span class="tag yellow">{_html_module.escape(p)}</span><span class="param-row">={_html_module.escape(v[:60])}</span>'
+            for p, v in param_list
+        )
+        param_items.append(f"{_url_link(url)}<div>{params_html}</div>")
+
+    # ── Stat cards ─────────────────────────────────────────────────────────
+    def _card(label: str, value, color: str = "blue") -> str:
+        return (f'<div class="stat-card"><div class="label">{label}</div>'
+                f'<div class="value {color}">{value}</div></div>')
+
+    stats = (
+        _card("Pages crawled", total_crawled, "blue") +
+        _card("404 errors", len(pages_404), "red" if pages_404 else "green") +
+        _card("403 forbidden", len(pages_403), "yellow" if pages_403 else "green") +
+        _card("Media skipped", len(pages_media), "muted") +
+        _card("External links", len(set(pages_external)), "blue") +
+        _card("URLs w/ params", len(params_by_url), "yellow" if params_by_url else "green")
+    )
+
+    # ── Assemble HTML ──────────────────────────────────────────────────────
+    sections = (
+        _html_section("🔴 404 Not Found", items_404, "red") +
+        _html_section("🟡 403 Forbidden", items_403, "yellow") +
+        _html_section("⚠️ Other HTTP Errors", items_other, "red") +
+        _html_section("🎞️ Media / Non-HTML (skipped)", items_media, "muted") +
+        _html_section("❌ Fetch Errors", items_error, "red") +
+        _html_section("🔗 External Links", items_ext, "blue") +
+        _html_section("🔍 URLs with GET Parameters", param_items, "yellow", open_by_default=bool(param_items)) +
+        _html_section("✅ Successfully Crawled Pages", items_ok, "green")
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crawl Report – {_html_module.escape(base_host)}</title>
+  {_HTML_STYLE}
+</head>
+<body>
+  <h1>Crawl Report</h1>
+  <p class="subtitle">Domain: <strong>{_html_module.escape(base_host)}</strong> &nbsp;|&nbsp; Generated: {timestamp}</p>
+  <div class="stats-grid">{stats}</div>
+  {sections}
+</body>
+</html>"""
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(C.green(f"[REPORT]") + f" HTML crawl report saved to {out_path}")
+
+
+# ---------------------------------------------------------------------------
+# HTML XSS Report
+# ---------------------------------------------------------------------------
+
+def generate_xss_report_html(
+    start_url: str,
+    canary: str,
+    reflected_hits: list,  # (base_url, param, label, desc, exploitable, test_url)
+    stored_hits: list[str],
+    out_path: str,
+):
+    """Write a self-contained HTML XSS report to *out_path*."""
+    import datetime
+    base_host = urlparse(start_url).netloc if start_url else ""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    exploitable  = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if ex]
+    filtered_ref = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if not ex]
+
+    def _url_link(u: str) -> str:
+        safe = _html_module.escape(u)
+        return f'<a href="{safe}" target="_blank">{safe}</a>'
+
+    # Reflected exploitable – group by base URL
+    refl_by_url: dict[str, list] = {}
+    for url, param, label, desc, test_url in exploitable:
+        refl_by_url.setdefault(url, []).append((param, label, desc, test_url))
+
+    refl_items = []
+    for url, hits in sorted(refl_by_url.items()):
+        inner = "".join(
+            f'<div class="xss-block">'
+            f'<span class="tag red">VULNERABLE</span>'
+            f'<span class="tag yellow">param={_html_module.escape(p)}</span>'
+            f'&nbsp;[{_html_module.escape(l)}]'
+            f'<div class="ctx">{_html_module.escape(d)}</div>'
+            f'<div class="turl"><a href="{_html_module.escape(tu)}" target="_blank">Test URL</a>: {_html_module.escape(tu)}</div>'
+            f'</div>'
+            for p, l, d, tu in hits
+        )
+        refl_items.append(f"{_url_link(url)}{inner}")
+
+    # Reflected filtered
+    filt_items = [
+        f'<span class="tag muted">{_html_module.escape(p)}</span>&nbsp;[{_html_module.escape(l)}]'
+        f'<div class="ctx">{_html_module.escape(d)}</div>'
+        for _, p, l, d, _ in filtered_ref
+    ]
+
+    # Stored XSS
+    stored_items = [_url_link(u) for u in stored_hits]
+
+    # Stat cards
+    def _card(label: str, value, color: str = "blue") -> str:
+        return (f'<div class="stat-card"><div class="label">{label}</div>'
+                f'<div class="value {color}">{value}</div></div>')
+
+    total_vulns = len(exploitable) + len(stored_hits)
+    stats = (
+        _card("Exploitable (Reflected)", len(exploitable), "red" if exploitable else "green") +
+        _card("Stored XSS", len(stored_hits), "red" if stored_hits else "green") +
+        _card("Filtered (Reflected)", len(filtered_ref), "yellow" if filtered_ref else "green") +
+        _card("Total Vulnerabilities", total_vulns, "red" if total_vulns else "green")
+    )
+
+    sections = (
+        _html_section("🔴 Exploitable Reflected XSS", refl_items, "red", open_by_default=bool(refl_items)) +
+        _html_section("💾 Stored XSS", stored_items, "red", open_by_default=bool(stored_items)) +
+        _html_section("🟡 Filtered / Encoded Reflections", filt_items, "yellow")
+    )
+
+    verdict = (
+        f'<p style="color:var(--red);font-size:1.1rem;font-weight:bold;margin-bottom:1.5rem">'
+        f'⚠️ {total_vulns} exploitable vulnerability/ies found!</p>'
+        if total_vulns else
+        f'<p style="color:var(--green);font-size:1.1rem;font-weight:bold;margin-bottom:1.5rem">'
+        f'✅ No exploitable XSS vulnerabilities found.</p>'
+    )
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>XSS Report – {_html_module.escape(base_host)}</title>
+  {_HTML_STYLE}
+</head>
+<body>
+  <h1>XSS Scan Report</h1>
+  <p class="subtitle">Domain: <strong>{_html_module.escape(base_host)}</strong> &nbsp;|&nbsp; Canary: <code>{_html_module.escape(canary)}</code> &nbsp;|&nbsp; Generated: {timestamp}</p>
+  {verdict}
+  <div class="stats-grid">{stats}</div>
+  {sections}
+</body>
+</html>"""
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    print(C.green(f"[REPORT]") + f" HTML XSS report saved to {out_path}")
+
+
 def print_findings(start_url: str = ""):
     conn = get_db()
 
@@ -449,19 +765,24 @@ def print_findings(start_url: str = ""):
     if not finding_rows:
         print(C.green("\n  No GET parameters found."))
         print(sep)
-        return
+    else:
+        print(C.bold("\n----- GET PARAMETER FINDINGS -----"))
+        current_url = None
+        for url, param, value in finding_rows:
+            if url != current_url:
+                if current_url is not None:
+                    print()
+                print(f"  URL   : {C.cyan(url)}")
+                current_url = url
+            print(f"    Param : {C.yellow(param)} = {value}")
+        print()
+        print(sep)
 
-    print(C.bold("\n----- GET PARAMETER FINDINGS -----"))
-    current_url = None
-    for url, param, value in finding_rows:
-        if url != current_url:
-            if current_url is not None:
-                print()
-            print(f"  URL   : {C.cyan(url)}")
-            current_url = url
-        print(f"    Param : {C.yellow(param)} = {value}")
-    print()
-    print(sep)
+    # Generate HTML crawl report
+    if start_url:
+        domain_name = urlparse(start_url).netloc.replace(":", "_") or "output"
+        html_path = os.path.join(_RESULTS_DIR, f"{domain_name}_crawl_report.html")
+        generate_crawl_report_html(start_url, html_path)
 
 
 # ---------------------------------------------------------------------------
@@ -963,7 +1284,6 @@ def run_xss_scan(start_url: str):
     # ── Report ───────────────────────────────────────────────────────────────
     exploitable = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if ex]
     filtered    = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if not ex]
-    filtered    = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if not ex]
 
     print(f"\n{sep}")
     print(C.bold("XSS SCAN REPORT"))
@@ -1025,6 +1345,11 @@ def run_xss_scan(start_url: str):
                 print(f"    {idx}. {C.red('STORED')}  {C.cyan(page_url)}")
                 idx += 1
     print(C.bold("=" * 60))
+
+    # Generate HTML XSS report
+    domain_name = urlparse(start_url).netloc.replace(":", "_") or "output"
+    html_path = os.path.join(_RESULTS_DIR, f"{domain_name}_xss_report.html")
+    generate_xss_report_html(start_url, canary, reflected_hits, stored_hits, html_path)
 
 
 # ---------------------------------------------------------------------------
