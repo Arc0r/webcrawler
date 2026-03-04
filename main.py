@@ -65,6 +65,75 @@ class C:
     @staticmethod
     def bold(s):    return f"{C.BOLD}{s}{C.RESET}"
 
+
+# ---------------------------------------------------------------------------
+# Dashboard – live 3-line progress display during crawl
+# ---------------------------------------------------------------------------
+
+class Dashboard:
+    """Renders a compact 3-line dashboard in-place on the real terminal."""
+
+    LINES = 3  # number of lines the dashboard occupies
+
+    def __init__(self, site: str):
+        self._site     = site
+        self._lock     = threading.Lock()
+        self._scanned  = 0
+        self._total    = 0
+        self._rendered = False
+        self._finalized = False
+        self._bar_width = 50
+
+    def _write(self, text: str):
+        """Write directly to the real terminal, bypassing any _Tee wrapper."""
+        sys.__stdout__.write(text)
+        sys.__stdout__.flush()
+
+    def update(self, scanned: int, total: int):
+        """Redraw the dashboard with the latest counts."""
+        with self._lock:
+            if self._finalized:
+                return
+            self._scanned = scanned
+            self._total   = total
+            self._render_locked()
+
+    def _render_locked(self):
+        """Render (must be called with self._lock held)."""
+        bar_width = self._bar_width
+        total     = self._total
+        scanned   = self._scanned
+
+        filled = int(bar_width * scanned / total) if total > 0 else 0
+        empty  = bar_width - filled
+        pct    = scanned / total * 100 if total > 0 else 0
+
+        bar_str = f"{C.GREEN}{'#' * filled}{C.RESET}{'-' * empty}"
+
+        lines = [
+            f"Crawling site {C.CYAN}{self._site}{C.RESET}",
+            f"Total links found: {C.BOLD}{total}{C.RESET}",
+            f"[{bar_str}] {scanned}/{total} ({pct:.0f}%)",
+        ]
+
+        if self._rendered:
+            self._write(f"\033[{self.LINES}A")  # move cursor up N lines
+
+        for line in lines:
+            self._write(f"\r\033[K{line}\n")    # clear line, print, newline
+
+        self._rendered = True
+
+    def finalize(self):
+        """Stop updates and leave the cursor on a clean new line."""
+        with self._lock:
+            if self._finalized:
+                return
+            self._finalized = True
+            if self._rendered:
+                self._write("\n")  # blank separator after last frame
+
+
 # Use the system CA bundle so that institutional CAs (e.g. HARICA) are trusted.
 # A custom bundle (ca-bundle-custom.pem) next to this script takes priority –
 # useful when a server omits intermediate certs that Firefox fetches via AIA.
@@ -365,6 +434,16 @@ def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5, worke
     add_url(conn, start_url)
     _db_lock = threading.Lock()  # guards parent-side DB reads/claims
 
+    site = urlparse(start_url).netloc
+    dashboard = Dashboard(site)
+
+    def _get_stats() -> tuple[int, int]:
+        """Return (scanned, total) from the DB under the lock."""
+        with _db_lock:
+            total   = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+            scanned = conn.execute("SELECT COUNT(*) FROM pages WHERE visited = 1").fetchone()[0]
+        return scanned, total
+
     def _claim_next() -> str | None:
         """Atomically grab and pre-mark one unvisited URL. Returns None if queue empty."""
         with _db_lock:
@@ -388,14 +467,16 @@ def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5, worke
                 return url
 
     def _run_worker(url: str):
+        # capture_output=True suppresses per-URL subprocess chatter; the
+        # dashboard shows progress instead.
         subprocess.run(
             [sys.executable, __file__, "--analyze", url],
-            capture_output=False,
+            capture_output=True,
         )
         time.sleep(delay)
 
-    if workers > 1:
-        print(C.cyan(f"[CRAWL]") + f" Starting with {C.bold(str(workers))} parallel workers")
+    # Initial dashboard render
+    dashboard.update(0, 1)
 
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -420,11 +501,17 @@ def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5, worke
                 for f in done:
                     f.result()
 
+                # Refresh dashboard with live DB counts
+                scanned, total = _get_stats()
+                dashboard.update(scanned, total)
+
     except KeyboardInterrupt:
-        print(C.yellow("\n\n[INTERRUPTED]") + " Crawl stopped by user. Saving report…")
+        dashboard.finalize()
+        print(C.yellow("\n[INTERRUPTED]") + " Crawl stopped by user. Saving report…")
     finally:
+        dashboard.finalize()
         conn.close()
-        print(C.green("\n[DONE]") + " Crawl finished.")
+        print(C.green("[DONE]") + " Crawl finished.")
         print_findings(start_url)
 
 
@@ -757,26 +844,6 @@ def print_findings(start_url: str = ""):
     print(f"  Pages crawled          : {C.bold(str(total_pages))}")
     print(f"  GET parameters found   : {C.yellow(str(len(finding_rows)))}")
     print(f"  URLs with parameters   : {C.yellow(str(affected_urls))}")
-
-    print(C.bold("\n----- CRAWLED PAGES -----"))
-    for page_url in visited_pages:
-        print(f"  {page_url}")
-
-    if not finding_rows:
-        print(C.green("\n  No GET parameters found."))
-        print(sep)
-    else:
-        print(C.bold("\n----- GET PARAMETER FINDINGS -----"))
-        current_url = None
-        for url, param, value in finding_rows:
-            if url != current_url:
-                if current_url is not None:
-                    print()
-                print(f"  URL   : {C.cyan(url)}")
-                current_url = url
-            print(f"    Param : {C.yellow(param)} = {value}")
-        print()
-        print(sep)
 
     # Generate HTML crawl report
     if start_url:
