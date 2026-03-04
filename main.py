@@ -203,6 +203,49 @@ def same_domain(base_url: str, url: str) -> bool:
     return base_host == target_host
 
 
+_IGNORED_EXTENSIONS = {
+    # media
+    ".mp4", ".m4v", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
+    ".mp3", ".ogg", ".wav", ".flac", ".aac",
+    # images
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp", ".ico", ".tif", ".tiff",
+    # documents
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods",
+    # archives
+    ".zip", ".tar", ".gz", ".bz2", ".xz", ".rar", ".7z",
+    # code / data
+    ".js", ".css", ".json", ".xml", ".csv", ".woff", ".woff2", ".ttf", ".eot",
+}
+
+# Ignore patterns set by --ignore flag; inherited by subprocesses via env var.
+import fnmatch as _fnmatch
+_IGNORE_PATTERNS: list[str] = [
+    p for p in os.environ.get("CRAWLER_IGNORE", "").split(",") if p
+]
+
+
+def _is_crawlable(url: str) -> bool:
+    """Return False if the URL matches an ignored extension or user pattern.
+
+    Pattern prefixes:
+      param:NAME  – skip any URL whose query string contains a parameter named NAME
+      (no prefix) – substring or glob match against the full URL
+    """
+    path = urlparse(url).path.lower().split("?")[0]
+    _, ext = os.path.splitext(path)
+    if ext in _IGNORED_EXTENSIONS:
+        return False
+    url_params = set(parse_qs(urlparse(url).query).keys())
+    for pat in _IGNORE_PATTERNS:
+        if pat.startswith("param:"):
+            param_name = pat[len("param:"):]
+            if param_name in url_params:
+                return False
+        elif _fnmatch.fnmatch(url, pat) or pat in url:
+            return False
+    return True
+
+
 def extract_links(html: str, base_url: str):
     """Return absolute URLs found in <a href=...> tags."""
     soup = BeautifulSoup(html, "html.parser")
@@ -212,8 +255,8 @@ def extract_links(html: str, base_url: str):
         # resolve relative URLs
         full = urljoin(base_url, href)
         parsed = urlparse(full)
-        # only http(s)
-        if parsed.scheme in ("http", "https"):
+        # only http(s) and crawlable file types
+        if parsed.scheme in ("http", "https") and _is_crawlable(full):
             links.add(full)
     return links
 
@@ -311,6 +354,8 @@ def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5, worke
                 conn.commit()
                 if stay_on_domain and not same_domain(start_url, url):
                     continue  # already marked, skip silently
+                if not _is_crawlable(url):
+                    continue  # matches --ignore pattern or bad extension
                 return url
 
     def _run_worker(url: str):
@@ -439,24 +484,53 @@ def _load_wordlist_samples(n: int = 2) -> list[str]:
     return [lines[min(i * step, len(lines) - 1)] for i in range(n)]
 
 
-def _check_reflection_context(html_text: str, canary: str) -> list[tuple[str, bool]]:
+def _check_reflection_context(html_text: str, canary: str, payload: str = "") -> list[tuple[str, bool]]:
     """
     Analyse where/how *canary* appears in *html_text*.
     Returns list of (description, exploitable) tuples.
+
+    Detection logic:
+    - If canary absent: check for entity/URL-encoded forms → filtered
+    - If payload had special chars (<>"') but they didn't survive: → filtered
+    - If payload IS literal in raw html: parse and determine execution context
     """
     results: list[tuple[str, bool]] = []
 
+    _html_special  = set('<>"\'')
+    _breakout_chars = set('<>"\'\x00')
+    _nav_attrs     = {"href", "src", "action", "formaction", "data"}
+    payload_has_special = bool(payload and _html_special & set(payload))
+    payload_specials    = _html_special & set(payload) if payload else set()
+
+    # ── canary not in raw html at all ────────────────────────────────────────
     if canary not in html_text:
-        # Check HTML-entity-encoded version (server escaped output)
         if _html_module.escape(canary) in html_text:
             results.append(("HTML-entity encoded – server escapes output (not exploitable)", False))
-        # Check URL-encoded (e.g. %3Cscript%3E)
-        url_enc = canary.replace("<", "%3C").replace(">", "%3E").replace("\"", "%22")
+        url_enc = canary.replace("<", "%3C").replace(">", "%3E").replace('"', "%22")
         if url_enc.lower() in html_text.lower():
             results.append(("URL-encoded reflection – filtered (not exploitable)", False))
         return results
 
-    # Raw canary present – analyse context
+    # ── canary present, but payload's special chars were encoded/stripped ────
+    if payload_has_special and payload not in html_text:
+        esc_payload = _html_module.escape(payload)          # e.g. &lt;canary&gt;
+        url_payload = payload.replace("<", "%3C").replace(">", "%3E").replace('"', "%22")
+        if esc_payload in html_text:
+            results.append(("HTML-entity encoded – &lt; &gt; escaped by server (not exploitable)", False))
+        elif url_payload.lower() in html_text.lower():
+            results.append(("URL-encoded – %3C %3E present (not exploitable)", False))
+        else:
+            # Check each special char individually
+            all_encoded = all(
+                _html_module.escape(c) in html_text or c.replace("<", "%3C").replace(">", "%3E") in html_text
+                for c in payload_specials
+            )
+            msg = ("special chars entity/URL-encoded by server (not exploitable)" if all_encoded
+                   else "special chars stripped or mangled by server (not exploitable)")
+            results.append((msg, False))
+        return results
+
+    # ── payload present literally – parse and classify context ───────────────
     try:
         soup = BeautifulSoup(html_text, "html.parser")
     except Exception:
@@ -465,33 +539,81 @@ def _check_reflection_context(html_text: str, canary: str) -> list[tuple[str, bo
 
     found_specific = False
 
+    def _canary_literally_in_raw(tag) -> bool:
+        """
+        True if canary appears in the re-serialised tag source WITHOUT being
+        immediately preceded by & or % (which would indicate entity/URL-encoding).
+        BS4's str() re-encodes < > & in attribute values, so if the server
+        entity-encoded the canary, it'll appear as &lt;canary&gt; in str(tag).
+        """
+        raw = str(tag)
+        idx = raw.find(canary)
+        while idx != -1:
+            before = raw[idx - 1] if idx > 0 else ""
+            if before not in ("&", "%"):
+                return True
+            idx = raw.find(canary, idx + 1)
+        return False
+
     # 1. Inside <script> blocks → JS execution context
     for script in soup.find_all("script"):
-        src = script.get("src")
-        if src:
-            continue  # external script
+        if script.get("src"):
+            continue
         content = script.string or ""
         if canary in content:
             results.append(("inside <script> block – JS execution likely", True))
             found_specific = True
 
-    # 2. Inside event-handler attributes (onclick, onerror, …)
+    # 2. Inside attributes
     for tag in soup.find_all(True):
         for attr, val in tag.attrs.items():
             v = val if isinstance(val, str) else " ".join(val)
-            if canary in v:
-                if attr.lower().startswith("on"):
+            if canary not in v:
+                continue
+
+            attr_l = attr.lower()
+
+            if attr_l.startswith("on"):
+                if _canary_literally_in_raw(tag):
                     results.append((f"in event attribute <{tag.name} {attr}=> – JS execution likely", True))
                     found_specific = True
-                elif attr.lower() in ("href", "src", "action", "formaction", "data"):
-                    results.append((f"in navigation attribute <{tag.name} {attr}=> – may be exploitable", True))
+
+            elif attr_l in _nav_attrs:
+                if _canary_literally_in_raw(tag):
+                    can_breakout = bool(payload and _breakout_chars & set(payload))
+                    is_js = v.lstrip().lower().startswith("javascript:")
+                    if can_breakout or is_js:
+                        results.append((f"in navigation attribute <{tag.name} {attr}=> – breakout possible", True))
+                    else:
+                        results.append((f"reflected in <{tag.name} {attr}=> (no breakout chars – informational)", False))
                     found_specific = True
                 else:
+                    results.append((f"entity/URL-encoded in <{tag.name} {attr}=> – filtered (not exploitable)", False))
+                    found_specific = True
+
+            else:
+                if _canary_literally_in_raw(tag):
                     results.append((f"in attribute <{tag.name} {attr}=>", True))
                     found_specific = True
 
-    # 3. Raw reflection in body (outside tags)
-    if not found_specific and canary in html_text:
+    # 3. Canary injected as an actual HTML element, e.g. <canary> in the DOM
+    if not found_specific:
+        try:
+            injected = soup.find(canary)
+        except Exception:
+            injected = None
+        if injected is not None and f"<{canary}" in html_text:
+            # Server did NOT escape <  – HTML injection confirmed.
+            # Not directly executable by itself, but < > are unfiltered.
+            results.append((
+                f"HTML tag injected – <{canary}> element created in DOM – "
+                "< not filtered (HTML injection, not directly executable)",
+                True,
+            ))
+            found_specific = True
+
+    # 4. Fallback: canary somewhere in raw html but no specific context found
+    if not found_specific:
         results.append(("raw reflection in HTML body", True))
 
     return results
@@ -547,8 +669,8 @@ def run_xss_scan(start_url: str):
         print(f"  Wordlist payloads ({len(wordlist_extras)}): verbatim from {XSS_WORDLIST}")
     print()
 
-    # (url, param, payload_label, context_description, exploitable)
-    reflected_hits: list[tuple[str, str, str, str, bool]] = []
+    # (base_url, param, label, desc, exploitable, test_url)
+    reflected_hits: list[tuple[str, str, str, str, bool, str]] = []
     stored_hits:   list[str] = []          # pages where canary was found after injection
 
     HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}
@@ -575,7 +697,7 @@ def run_xss_scan(start_url: str):
                     try:
                         resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
                                             headers=HEADERS, allow_redirects=True)
-                        contexts = _check_reflection_context(resp.text, canary)
+                        contexts = _check_reflection_context(resp.text, canary, payload)
 
                         if not contexts:
                             print(C.green("  [safe]") + f" param={param} [{label}]")
@@ -583,12 +705,13 @@ def run_xss_scan(start_url: str):
                             for desc, exploitable in contexts:
                                 icon = C.red("[VULNERABLE]") if exploitable else C.yellow("[FILTERED]")
                                 print(f"  {icon} param={C.yellow(param)} [{label}]")
-                                print(f"    Context : {desc}")
+                                print(f"    Context  : {desc}")
                                 if exploitable:
-                                    reflected_hits.append((base_url, param, label, desc, True))
+                                    print(f"    Test URL : {C.magenta(test_url)}")
+                                    reflected_hits.append((base_url, param, label, desc, True, test_url))
                                     param_hit = True
                                 else:
-                                    reflected_hits.append((base_url, param, label, desc, False))
+                                    reflected_hits.append((base_url, param, label, desc, False, test_url))
                     except Exception as exc:
                         print(C.red("  [ERROR]") + f" {exc}")
 
@@ -604,8 +727,9 @@ def run_xss_scan(start_url: str):
                                             headers=HEADERS, allow_redirects=True)
                         if payload in resp.text:
                             print(C.red("  [VULNERABLE]") + f" param={C.yellow(param)} [wordlist] verbatim reflected")
-                            print(f"    Payload : {payload[:80]} ... (full payload may be longer)")
-                            reflected_hits.append((base_url, param, "wordlist", "verbatim reflection", True))
+                            print(f"    Payload  : {payload[:80]}")
+                            print(f"    Test URL : {C.magenta(test_url)}")
+                            reflected_hits.append((base_url, param, "wordlist", "verbatim reflection", True, test_url))
                             param_hit = True
                         else:
                             print(C.green("  [safe]") + f" param={param} [wordlist]")
@@ -620,7 +744,7 @@ def run_xss_scan(start_url: str):
                 resp = requests.get(page_url, timeout=10, verify=CA_BUNDLE,
                                     headers=HEADERS, allow_redirects=True)
                 if canary in resp.text:
-                    contexts = _check_reflection_context(resp.text, canary)
+                    contexts = _check_reflection_context(resp.text, canary, canary)
                     for desc, exploitable in contexts:
                         icon = C.red("[STORED XSS]") if exploitable else C.yellow("[STORED/FILTERED]")
                         print(f"  {icon} {C.cyan(page_url)}")
@@ -635,8 +759,9 @@ def run_xss_scan(start_url: str):
         print(C.yellow("\n\n[INTERRUPTED]") + " XSS scan stopped by user. Printing partial report…")
 
     # ── Report ───────────────────────────────────────────────────────────────
-    exploitable = [(u, p, l, d) for u, p, l, d, ex in reflected_hits if ex]
-    filtered    = [(u, p, l, d) for u, p, l, d, ex in reflected_hits if not ex]
+    exploitable = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if ex]
+    filtered    = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if not ex]
+    filtered    = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if not ex]
 
     print(f"\n{sep}")
     print(C.bold("XSS SCAN REPORT"))
@@ -651,16 +776,17 @@ def run_xss_scan(start_url: str):
         if exploitable:
             print(C.red(C.bold(f"  {len(exploitable)} exploitable reflection(s):")))
             shown: set[str] = set()
-            for url, param, label, desc in exploitable:
+            for url, param, label, desc, test_url in exploitable:
                 if url not in shown:
                     print(f"    {C.cyan(url)}")
                     shown.add(url)
                 print(f"      " + C.red("VULNERABLE") + f" param={C.yellow(param)} [{label}]")
-                print(f"      Context : {desc}")
+                print(f"      Context  : {desc}")
+                print(f"      Test URL : {C.magenta(test_url)}")
             print()
         if filtered:
             print(C.yellow(f"  {len(filtered)} filtered/encoded reflection(s) – output is escaped:"))
-            for url, param, label, desc in filtered:
+            for url, param, label, desc, test_url in filtered:
                 print(f"    param={param} [{label}] – {desc}")
 
     print()
@@ -711,16 +837,25 @@ def show_help():
   python {prog} {C.cyan('<start_url>')} [options]
 
 {C.bold('Options:')}
-  {C.cyan('(none)')}            Crawl start_url, stay on same domain
-  {C.cyan('--all-domains')}     Follow links to other domains too
-  {C.cyan('--workers N')}       Fetch N pages in parallel (default: 1)
-  {C.cyan('--recrawl')}         Reset DB for start_url's domain and re-crawl
-  {C.cyan('--xss')}             Run reflected/stored XSS tests on stored URLs
-  {C.cyan('--help')}            Show this help
+  {C.cyan('(none)')}              Crawl start_url, stay on same domain
+  {C.cyan('--all-domains')}       Follow links to other domains too
+  {C.cyan('--workers N')}         Fetch N pages in parallel (default: 1)
+  {C.cyan('--ignore PATTERN')}    Skip URLs matching PATTERN (substring or glob, repeatable)
+  {C.cyan('--recrawl')}           Reset DB for start_url's domain and re-crawl
+  {C.cyan('--xss')}               Run reflected/stored XSS tests on stored URLs
+  {C.cyan('--help')}              Show this help
+
+{C.bold('--ignore examples:')}
+  --ignore /logout              skip any URL containing /logout
+  --ignore "*/admin/*"          skip URLs matching glob pattern
+  --ignore param:action         skip any URL with a query param named "action"
+  --ignore param:id             skip any URL with a query param named "id"
+  --ignore /print --ignore /rss multiple patterns supported
 
 {C.bold('Examples:')}
   python {prog} https://example.com
   python {prog} https://example.com --workers 5
+  python {prog} https://example.com --ignore /logout --ignore /print
   python {prog} https://example.com --recrawl --workers 8
   python {prog} https://example.com --xss
   python {prog} https://example.com --all-domains
@@ -758,6 +893,15 @@ if __name__ == "__main__":
     print(f"[LOG] Output mirrored to {log_path}")
 
     stay = "--all-domains" not in args
+
+    # Parse --ignore PATTERN (repeatable)
+    ignore_patterns: list[str] = []
+    for i, a in enumerate(args):
+        if a == "--ignore" and i + 1 < len(args):
+            ignore_patterns.append(args[i + 1])
+    if ignore_patterns:
+        os.environ["CRAWLER_IGNORE"] = ",".join(ignore_patterns)
+        print(C.yellow(f"[IGNORE]") + f" Active patterns: {ignore_patterns}")
 
     # Parse --workers N (default 1)
     workers = 1

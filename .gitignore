@@ -1,5 +1,5 @@
 *.pem
-*.db
+*.db*
 __pycache__
 .venv
 results/*
