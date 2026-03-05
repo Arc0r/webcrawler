@@ -1,7 +1,6 @@
 import sys
 import time
 import sqlite3
-import subprocess
 import os
 import re
 import random
@@ -20,8 +19,10 @@ from bs4 import BeautifulSoup
 class _Tee:
     """Wraps sys.stdout to mirror all output into a log file."""
     def __init__(self, filepath: str):
+        global _tee_instance
         self._term = sys.__stdout__
         self._file = open(filepath, "a", encoding="utf-8")
+        _tee_instance = self
 
     def write(self, data: str):
         self._term.write(data)
@@ -38,6 +39,26 @@ class _Tee:
 
     def fileno(self):
         return self._term.fileno()
+
+# Global tee reference so worker threads can write to the log file without
+# printing to the terminal (keeps the dashboard display clean).
+_tee_instance: "_Tee | None" = None
+_worker_log_lock = threading.Lock()
+
+def _worker_log(*args, **kwargs):
+    """Write to the log file only – bypasses the terminal so the dashboard
+    is not disrupted by per-URL output from worker threads."""
+    msg = " ".join(str(a) for a in args)
+    end = kwargs.get("end", "\n")
+    text = re.sub(r"\033\[[0-9;]*m", "", msg + end)  # strip ANSI for file
+    with _worker_log_lock:
+        if _tee_instance is not None:
+            _tee_instance._file.write(text)
+            _tee_instance._file.flush()
+        else:
+            # No tee active (e.g. standalone call): fall back to real stdout.
+            sys.__stdout__.write(msg + end)
+            sys.__stdout__.flush()
 
 # ---------------------------------------------------------------------------
 # Colors
@@ -169,7 +190,8 @@ DB_FILE = "crawler.db"
 
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")  # allow concurrent subprocess writes
+    conn.execute("PRAGMA journal_mode=WAL")       # allow concurrent writes from worker threads
+    conn.execute("PRAGMA busy_timeout = 5000")  # retry up to 5 s on lock contention
     conn.execute(
         """CREATE TABLE IF NOT EXISTS pages (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -301,11 +323,10 @@ _IGNORED_EXTENSIONS = {
     ".js", ".css", ".json", ".xml", ".csv", ".woff", ".woff2", ".ttf", ".eot",
 }
 
-# Ignore patterns set by --ignore flag; inherited by subprocesses via env var.
+# Ignore patterns set by CLI before crawl starts; shared across all worker threads.
+# Append to this list in __main__ instead of using env vars.
 import fnmatch as _fnmatch
-_IGNORE_PATTERNS: list[str] = [
-    p for p in os.environ.get("CRAWLER_IGNORE", "").split(",") if p
-]
+_IGNORE_PATTERNS: list[str] = []
 
 
 def _is_crawlable(url: str) -> bool:
@@ -352,24 +373,28 @@ def extract_get_params(url: str):
 
 
 # ---------------------------------------------------------------------------
-# Analyzer (called as subprocess)
+# Analyzer – runs inside each worker thread
 # ---------------------------------------------------------------------------
 
-def analyze_url(url: str):
+def analyze_url(url: str, log=print):
     """
-    Fetch *url*, extract GET params, store new links in DB.
-    This function is invoked in a subprocess.
+    Fetch *url*, record GET params, and store newly discovered links in the DB.
+
+    Each worker thread calls this with its own DB connection (get_db() per
+    call). WAL mode + busy_timeout lets concurrent writers co-exist safely.
+    Pass *log=_worker_log* from the master to route output to the log file
+    only, keeping the terminal dashboard clean.
     """
     conn = get_db()
 
-    print(C.cyan(f"[ANALYZE]") + f" {url}")
+    log(C.cyan(f"[ANALYZE]") + f" {url}")
 
     # ---- check / report GET parameters already visible in the URL ----------
     params = extract_get_params(url)
     if params:
         for param, values in params.items():
             for val in values:
-                print(C.yellow(f"  [GET PARAM]") + f" {param}={val}  (url: {url})")
+                log(C.yellow(f"  [GET PARAM]") + f" {param}={val}  (url: {url})")
                 save_finding(conn, url, param, val)
 
     # ---- fetch page --------------------------------------------------------
@@ -377,9 +402,9 @@ def analyze_url(url: str):
         resp = requests.get(url, timeout=10, verify=CA_BUNDLE, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"})
         try:
             resp.raise_for_status()
-        except requests.exceptions.HTTPError as http_err:
+        except requests.exceptions.HTTPError:
             status = resp.status_code
-            print(C.red(f"  [HTTP {status}]") + f" {url}")
+            log(C.red(f"  [HTTP {status}]") + f" {url}")
             set_page_status(conn, url, status)
             mark_visited(conn, url)
             conn.close()
@@ -387,7 +412,7 @@ def analyze_url(url: str):
         content_type = resp.headers.get("Content-Type", "")
         if "html" not in content_type:
             ct_short = content_type.split(";")[0].strip()
-            print(f"  [SKIP] Non-HTML content ({ct_short})")
+            log(f"  [SKIP] Non-HTML content ({ct_short})")
             set_page_status(conn, url, resp.status_code, f"media:{ct_short}")
             mark_visited(conn, url)
             conn.close()
@@ -397,7 +422,7 @@ def analyze_url(url: str):
     except requests.exceptions.HTTPError:
         pass  # handled above
     except Exception as exc:
-        print(C.red(f"  [ERROR]") + f" Could not fetch {url}: {exc}")
+        log(C.red(f"  [ERROR]") + f" Could not fetch {url}: {exc}")
         set_page_status(conn, url, 0, f"error:{exc}")
         mark_visited(conn, url)
         conn.close()
@@ -415,10 +440,10 @@ def analyze_url(url: str):
             if link_params:
                 for param, values in link_params.items():
                     for val in values:
-                        print(C.yellow(f"  [GET PARAM in link]") + f" {param}={val}  (url: {link})")
+                        log(C.yellow(f"  [GET PARAM in link]") + f" {param}={val}  (url: {link})")
                         save_finding(conn, link, param, val)
 
-    print(f"  [LINKS] found {len(links)} links, " + C.green(f"{new_count} new"))
+    log(f"  [LINKS] found {len(links)} links, " + C.green(f"{new_count} new"))
 
     # ---- mark as done ------------------------------------------------------
     mark_visited(conn, url)
@@ -467,12 +492,10 @@ def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5, worke
                 return url
 
     def _run_worker(url: str):
-        # capture_output=True suppresses per-URL subprocess chatter; the
-        # dashboard shows progress instead.
-        subprocess.run(
-            [sys.executable, __file__, "--analyze", url],
-            capture_output=True,
-        )
+        # Each thread has its own DB connection (WAL + busy_timeout handles contention).
+        # _worker_log routes output to the log file only, leaving the terminal
+        # dashboard undisturbed.
+        analyze_url(url, log=_worker_log)
         time.sleep(delay)
 
     # Initial dashboard render
@@ -1427,16 +1450,11 @@ def recrawl(start_url: str, stay_on_domain: bool = True, workers: int = 1):
     """Delete all DB entries for start_url's domain, then crawl fresh."""
     conn = get_db()
     base_host = urlparse(start_url).netloc
-
     # Remove pages and findings belonging to this domain
-    pages = conn.execute("SELECT id, url FROM pages").fetchall()
+    pages = conn.execute("SELECT id, url FROM pages WHERE url LIKE ?", (f"%{base_host}%",)).fetchall()
     ids_to_delete = [str(pid) for pid, url in pages if urlparse(url).netloc == base_host]
-    if ids_to_delete:
-        conn.execute(f"DELETE FROM pages WHERE id IN ({','.join(ids_to_delete)})")
-    findings = conn.execute("SELECT id, url FROM findings").fetchall()
-    fids = [str(fid) for fid, url in findings if urlparse(url).netloc == base_host]
-    if fids:
-        conn.execute(f"DELETE FROM findings WHERE id IN ({','.join(fids)})")
+    conn.execute(f"DELETE FROM pages WHERE url LIKE ?", (f"%{base_host}%",))
+    conn.execute(f"DELETE FROM findings WHERE url LIKE ?", (f"%{base_host}%",))
     conn.commit()
     conn.close()
 
@@ -1490,10 +1508,6 @@ def show_help():
 if __name__ == "__main__":
     args = sys.argv[1:]
 
-    # Internal subprocess mode (no tee – output is already captured by parent)
-    if len(sys.argv) == 3 and sys.argv[1] == "--analyze":
-        analyze_url(sys.argv[2])
-        sys.exit(0)
 
     # Help
     if "--help" in args or "-h" in args or not args:
@@ -1521,7 +1535,7 @@ if __name__ == "__main__":
         if a == "--ignore" and i + 1 < len(args):
             ignore_patterns.append(args[i + 1])
     if ignore_patterns:
-        os.environ["CRAWLER_IGNORE"] = ",".join(ignore_patterns)
+        _IGNORE_PATTERNS.extend(ignore_patterns)  # shared directly with worker threads
         print(C.yellow(f"[IGNORE]") + f" Active patterns: {ignore_patterns}")
 
     # Parse --workers N (default 1)
