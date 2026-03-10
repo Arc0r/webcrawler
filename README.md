@@ -10,12 +10,15 @@ A web crawler and XSS scanner written in Python. Crawls a target domain, discove
 - Discovers and records GET parameters from links
 - Deduplicates URLs by **parameter names** (not values) — `?name=A&age=B` and `?name=X&age=Y` count as the same URL, but `?name=A` and `?name=A&age=B` are different
 - Persists state in a local SQLite database (`crawler.db`) — interrupted crawls can be resumed
+- **Referer tracking** — every discovered URL stores the page it was first found on (`referer` column)
+- **Link topology** — all directed page→page link relationships are stored in a `links` table
 - **Parallel crawling** via `--workers N` for faster coverage
 - XSS scanner with canary-based detection, HTML context analysis, and stored XSS detection
 - Colour-coded terminal output
 - All output is simultaneously saved to `results/<domain>.txt` (ANSI codes stripped)
 - Skips non-HTML content (videos, PDFs, etc.) automatically
 - **HTML Crawl Report** generated automatically after every crawl (`results/<domain>_crawl_report.html`)
+  - Includes an interactive **Site Topology graph** (force-directed canvas visualization)
 - **HTML XSS Report** generated automatically after every XSS scan (`results/<domain>_xss_report.html`)
 - Reports feature collapsible sections per finding category, dark-themed UI
 
@@ -145,6 +148,44 @@ https://example.com/page.php?name=SONST&age=20
 This means:
 - `?name=SONST&age=20` and `?name=BLA&age=23` → **same URL** (skipped)
 - `?name=SONST` and `?name=SONST&age=20` → **different URLs** (both crawled)
+
+### Referer Tracking & Link Topology
+
+Every time a new URL is discovered on a page, the **source page URL is stored as the referer** in the `pages` table.  
+Additionally, *every* directed link relationship (`source → target`) is recorded in the `links` table — even if the target page was already known, so the complete link graph is captured.
+
+The SQLite schema for topology data:
+
+```sql
+-- pages.referer: the first page this URL was seen on
+ALTER TABLE pages ADD COLUMN referer TEXT NOT NULL DEFAULT '';
+
+-- links: full directed edge list for topology
+CREATE TABLE links (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    source  TEXT NOT NULL,   -- canonical source URL
+    target  TEXT NOT NULL,   -- canonical target URL
+    UNIQUE(source, target)
+);
+```
+
+### Site Topology Graph
+
+The HTML Crawl Report (`results/<domain>_crawl_report.html`) includes an interactive **Site Topology** section rendered directly in the browser — no external libraries required.
+
+The graph uses a **force-directed layout** implemented in vanilla JavaScript on an HTML5 Canvas:
+
+- **Nodes** represent crawled pages, coloured by HTTP status:
+  - 🟢 Green — 200 OK
+  - 🔴 Red — 4xx error or fetch failure
+  - 🟡 Yellow — 3xx redirect
+  - ⚫ Gray — skipped (media, non-HTML)
+- **Edges** are the discovered links between pages (directed, source → target)
+- **Hover** a node to see its full URL in a tooltip
+- **Click** a node to open the page in a new tab
+- Edges connected to the hovered node are highlighted in blue
+- The simulation runs for ~12 seconds to reach a stable layout, then freezes (interaction remains active)
+- Up to 600 internal nodes are shown (visited pages have priority if the site is larger)
 
 ### XSS Scanning (`--xss`)
 
