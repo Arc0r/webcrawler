@@ -1,6 +1,7 @@
 import sys
 import time
 import sqlite3
+import json
 import os
 import re
 import random
@@ -199,7 +200,8 @@ def get_db():
             canonical   TEXT    UNIQUE NOT NULL,
             visited     INTEGER NOT NULL DEFAULT 0,
             status_code INTEGER NOT NULL DEFAULT 0,
-            skip_reason TEXT    NOT NULL DEFAULT ''
+            skip_reason TEXT    NOT NULL DEFAULT '',
+            referer     TEXT    NOT NULL DEFAULT ''
         )"""
     )
     conn.execute(
@@ -208,6 +210,14 @@ def get_db():
             url        TEXT NOT NULL,
             param      TEXT NOT NULL,
             value      TEXT NOT NULL
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS links (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            source  TEXT NOT NULL,
+            target  TEXT NOT NULL,
+            UNIQUE(source, target)
         )"""
     )
     # --- migration: add canonical column to old DBs that only have url UNIQUE ---
@@ -227,17 +237,27 @@ def get_db():
         conn.execute("ALTER TABLE pages ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0")
     if "skip_reason" not in cols:
         conn.execute("ALTER TABLE pages ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''")
+    if "referer" not in cols:
+        conn.execute("ALTER TABLE pages ADD COLUMN referer TEXT NOT NULL DEFAULT ''")
+    # Create links table for topology (idempotent)
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS links (
+            id      INTEGER PRIMARY KEY AUTOINCREMENT,
+            source  TEXT NOT NULL,
+            target  TEXT NOT NULL,
+            UNIQUE(source, target)
+        )"""
+    )
     conn.commit()
     return conn
 
 
-def add_url(conn: sqlite3.Connection, url: str):
+def add_url(conn: sqlite3.Connection, url: str, referer: str = ""):
     """Insert url if its canonical form doesn't exist yet."""
     conn.execute(
-        "INSERT OR IGNORE INTO pages (url, canonical, visited) VALUES (?, ?, 0)",
-        (url, canonical_url(url)),
+        "INSERT OR IGNORE INTO pages (url, canonical, visited, referer) VALUES (?, ?, 0, ?)",
+        (url, canonical_url(url), referer),
     )
-    conn.commit()
 
 
 def mark_visited(conn: sqlite3.Connection, url: str):
@@ -265,7 +285,14 @@ def save_finding(conn: sqlite3.Connection, url: str, param: str, value: str):
         "INSERT INTO findings (url, param, value) VALUES (?, ?, ?)",
         (url, param, value),
     )
-    conn.commit()
+
+
+def save_link(conn: sqlite3.Connection, source: str, target: str):
+    """Record a directed link source→target for site topology mapping."""
+    conn.execute(
+        "INSERT OR IGNORE INTO links (source, target) VALUES (?, ?)",
+        (canonical_url(source), canonical_url(target)),
+    )
 
 
 def set_page_status(conn: sqlite3.Connection, url: str, status_code: int, skip_reason: str = ""):
@@ -433,7 +460,7 @@ def analyze_url(url: str, log=print):
     new_count = 0
     for link in links:
         if not url_known(conn, link):
-            add_url(conn, link)
+            add_url(conn, link, referer=url)
             new_count += 1
             # also check GET params right in the href
             link_params = extract_get_params(link)
@@ -442,6 +469,8 @@ def analyze_url(url: str, log=print):
                     for val in values:
                         log(C.yellow(f"  [GET PARAM in link]") + f" {param}={val}  (url: {link})")
                         save_finding(conn, link, param, val)
+        # Always record the directed link for topology (duplicates ignored by DB)
+        save_link(conn, url, link)
 
     log(f"  [LINKS] found {len(links)} links, " + C.green(f"{new_count} new"))
 
@@ -457,6 +486,7 @@ def analyze_url(url: str, log=print):
 def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5, workers: int = 1):
     conn = get_db()
     add_url(conn, start_url)
+    conn.commit()  # flush the seed URL so workers can see it immediately
     _db_lock = threading.Lock()  # guards parent-side DB reads/claims
 
     site = urlparse(start_url).netloc
@@ -597,6 +627,27 @@ _HTML_STYLE = """
   .xss-block { padding: 0.6rem; margin: 0.4rem 0; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); }
   .xss-block .ctx  { font-size: 0.8rem; color: var(--muted); margin-top: 0.3rem; }
   .xss-block .turl { font-size: 0.78rem; color: var(--blue); margin-top: 0.2rem; word-break: break-all; }
+  /* ── Topology ─────────────────────────────────────────────── */
+  .topo-info { color: var(--muted); font-size: 0.82rem; margin-bottom: 0.75rem; }
+  #topo-wrap { position: relative; border: 1px solid var(--border); border-radius: 6px 6px 0 0; overflow: hidden; background: #080c10; }
+  #topo-canvas { display: block; width: 100%; }
+  #topo-tooltip { position: absolute; background: rgba(13,17,23,0.96); border: 1px solid var(--border);
+                  color: var(--text); font-size: 0.75rem; padding: 0.35rem 0.65rem; border-radius: 6px;
+                  pointer-events: none; display: none; max-width: 460px; word-break: break-all; z-index: 10; }
+  .topo-legend { display: flex; flex-wrap: wrap; gap: 0.75rem; padding: 0.6rem 1rem;
+                 border: 1px solid var(--border); border-top: none; border-radius: 0 0 6px 6px;
+                 font-size: 0.8rem; background: var(--surface); margin-bottom: 0.25rem; }
+  .topo-legend span { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--muted); }
+  .topo-legend span::before { content: ''; display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
+  .topo-legend .leg-ok::before   { background: #3fb950; }
+  .topo-legend .leg-err::before  { background: #f85149; }
+  .topo-legend .leg-warn::before { background: #d29922; }
+  .topo-legend .leg-skip::before { background: #8b949e; }
+  .topo-legend .leg-start::before { background: #f0b429; outline: 2px solid #fff; outline-offset: 1px; }
+  .topo-btn { font-size:0.75rem; padding:0.15rem 0.6rem; border-radius:4px;
+              border:1px solid var(--border); background:var(--surface);
+              color:var(--text); cursor:pointer; }
+  .topo-btn:hover { background: var(--border); }
 </style>
 """
 
@@ -611,6 +662,346 @@ def _html_section(title: str, items: list[str], color: str = "muted", open_by_de
         rows = "\n".join(f"<li>{item}</li>" for item in items)
         body = f'<div class="detail-body"><ul class="url-list">{rows}</ul></div>'
     return f"<details{open_attr}>{header}{body}</details>"
+
+
+def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int = 600) -> str:
+    """Build a self-contained canvas topology section (force-directed graph)."""
+    conn = get_db()
+    pages = conn.execute(
+        "SELECT canonical, url, visited, status_code, skip_reason FROM pages ORDER BY url"
+    ).fetchall()
+    link_rows = conn.execute("SELECT source, target FROM links").fetchall()
+    conn.close()
+
+    start_canonical = canonical_url(start_url) if start_url else ""
+
+    # Internal pages only, up to max_nodes (visited pages have priority)
+    internal = [
+        (can, url, vis, sc, sr) for can, url, vis, sc, sr in pages
+        if not base_host or urlparse(url).netloc == base_host
+    ]
+    if len(internal) > max_nodes:
+        internal = sorted(internal, key=lambda x: -x[2])[:max_nodes]
+
+    if not internal:
+        return ""
+
+    can_to_idx = {can: i for i, (can, *_) in enumerate(internal)}
+
+    def _node_color(sc: int, sr: str, vis: int) -> str:
+        # Not yet fetched (unvisited / filtered before fetch)
+        if not vis and sc == 0:
+            return "#8b949e"
+        if sr.startswith("media:"):
+            return "#8b949e"
+        if sr.startswith("error:"):
+            return "#f85149"
+        if sc == 200:
+            return "#3fb950"
+        if sc >= 400:
+            return "#f85149"
+        if sc >= 300:
+            return "#d29922"
+        if vis:
+            return "#3fb950"
+        return "#8b949e"
+
+    nodes_data = [
+        {
+            "url": url,
+            "label": (urlparse(url).path or "/")[:50],
+            "color": _node_color(sc, sr, vis),
+            "isStart": (can == start_canonical),
+        }
+        for can, url, vis, sc, sr in internal
+    ]
+
+    edges_data = []
+    seen_edges: set[tuple[int, int]] = set()
+    for source, target in link_rows:
+        si = can_to_idx.get(source)
+        ti = can_to_idx.get(target)
+        if si is not None and ti is not None and si != ti:
+            key = (si, ti)
+            if key not in seen_edges:
+                seen_edges.add(key)
+                edges_data.append({"s": si, "t": ti})
+
+    nodes_json = json.dumps(nodes_data)
+    edges_json = json.dumps(edges_data)
+    n_nodes = len(nodes_data)
+    n_edges = len(edges_data)
+    capped = f" (capped at {max_nodes})" if len(internal) == max_nodes else ""
+
+    js = f"""
+(function(){{
+  const nodes = {nodes_json};
+  const edges = {edges_json};
+  if (!nodes.length) return;
+
+  const details  = document.getElementById('topo-details');
+  const canvas   = document.getElementById('topo-canvas');
+  const tooltip  = document.getElementById('topo-tooltip');
+  const ctx      = canvas.getContext('2d');
+  const rad      = Math.max(3, Math.min(9, Math.sqrt(5000 / nodes.length)));
+
+  let pan  = {{x: 0, y: 0}};
+  let zoom = 1.0;
+  let initialized = false;
+  let running     = false;
+  let alpha       = 1.0;
+  let hoveredIdx  = -1;
+  let dragIdx     = -1;
+  let isPanning   = false;
+  let hasDragged  = false;
+  let lastMouse   = {{x: 0, y: 0}};
+  let ideal = 60;
+
+  const K_repel  = Math.max(800, 60000 / nodes.length);
+  const K_spring = 0.035;
+  const K_center = 0.003;
+  let   maxV     = ideal;  // velocity cap, updated after resize()
+
+  function resize() {{
+    const w = canvas.parentElement.clientWidth || 900;
+    canvas.width  = w;
+    canvas.height = Math.max(520, Math.min(820, Math.round(w * 0.62)));
+    ideal = Math.max(35, Math.min(120,
+      Math.sqrt(canvas.width * canvas.height / nodes.length) * 0.7));
+    maxV  = ideal;
+    pan   = {{x: canvas.width / 2, y: canvas.height / 2}};
+    zoom  = 1.0;
+  }}
+
+  function initPositions() {{
+    // Fibonacci spiral: evenly distributes nodes across a disk so no two
+    // neighbours start absurdly close and cause a repulsion explosion.
+    const phi = Math.PI * (3 - Math.sqrt(5));  // golden angle ≈ 137.5°
+    const spread = Math.min(canvas.width, canvas.height) * 0.4;
+    nodes.forEach((n, i) => {{
+      const r = spread * Math.sqrt((i + 0.5) / nodes.length);
+      const theta = phi * i;
+      n.x = r * Math.cos(theta);
+      n.y = r * Math.sin(theta);
+      n.vx = 0; n.vy = 0;
+    }});
+  }}
+
+  function screenToWorld(sx, sy) {{
+    return {{x: (sx - pan.x) / zoom, y: (sy - pan.y) / zoom}};
+  }}
+
+  function tick() {{
+    if (alpha < 0.004) {{ running = false; return; }}
+    alpha *= 0.992;
+    nodes.forEach(n => {{ n.fx = -n.x * K_center; n.fy = -n.y * K_center; }});
+    for (let i = 0; i < nodes.length; i++) {{
+      for (let j = i + 1; j < nodes.length; j++) {{
+        const dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
+        const d2 = dx*dx + dy*dy + 1, d = Math.sqrt(d2);
+        const f  = K_repel / d2;
+        nodes[i].fx += f*dx/d; nodes[i].fy += f*dy/d;
+        nodes[j].fx -= f*dx/d; nodes[j].fy -= f*dy/d;
+      }}
+    }}
+    edges.forEach(({{s, t}}) => {{
+      if (s >= nodes.length || t >= nodes.length) return;
+      const dx = nodes[t].x - nodes[s].x, dy = nodes[t].y - nodes[s].y;
+      const d  = Math.sqrt(dx*dx + dy*dy) || 1;
+      const f  = K_spring * (d - ideal);
+      const fx = f*dx/d, fy = f*dy/d;
+      nodes[s].fx += fx; nodes[s].fy += fy;
+      nodes[t].fx -= fx; nodes[t].fy -= fy;
+    }});
+    nodes.forEach((n, i) => {{
+      if (i === dragIdx) return;
+      n.vx = Math.max(-maxV, Math.min(maxV, (n.vx + n.fx * alpha) * 0.65));
+      n.vy = Math.max(-maxV, Math.min(maxV, (n.vy + n.fy * alpha) * 0.65));
+      n.x += n.vx; n.y += n.vy;
+    }});
+  }}
+
+  function draw() {{
+    ctx.save();
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.setTransform(zoom, 0, 0, zoom, pan.x, pan.y);
+    edges.forEach(({{s, t}}) => {{
+      if (s >= nodes.length || t >= nodes.length) return;
+      const hi = (s === hoveredIdx || t === hoveredIdx || s === dragIdx || t === dragIdx);
+      ctx.strokeStyle = hi ? 'rgba(88,166,255,0.75)' : 'rgba(88,166,255,0.13)';
+      ctx.lineWidth   = (hi ? 1.4 : 0.7) / zoom;
+      ctx.beginPath();
+      ctx.moveTo(nodes[s].x, nodes[s].y);
+      ctx.lineTo(nodes[t].x, nodes[t].y);
+      ctx.stroke();
+    }});
+    nodes.forEach((n, i) => {{
+      const isActive = (i === hoveredIdx || i === dragIdx);
+      const isStart  = n.isStart;
+      const r = ((isStart ? rad + 5 : isActive ? rad + 3 : rad)) / zoom;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, r, 0, 2 * Math.PI);
+      ctx.fillStyle = isStart ? '#f0b429' : n.color;
+      ctx.fill();
+      if (isStart) {{
+        // Gold outer ring
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth   = 2.5 / zoom;
+        ctx.stroke();
+      }} else if (isActive) {{
+        ctx.strokeStyle = '#e6edf3';
+        ctx.lineWidth   = 1.5 / zoom;
+        ctx.stroke();
+      }}
+    }});
+    ctx.restore();
+  }}
+
+  function loop() {{ tick(); draw(); if (running) requestAnimationFrame(loop); }}
+
+  function mousePos(e) {{
+    const rect = canvas.getBoundingClientRect();
+    return {{
+      sx: (e.clientX - rect.left) * (canvas.width  / rect.width),
+      sy: (e.clientY - rect.top)  * (canvas.height / rect.height),
+      ox: e.offsetX, oy: e.offsetY,
+    }};
+  }}
+
+  function pickNode(sx, sy) {{
+    const w = screenToWorld(sx, sy);
+    const r2 = ((rad + 8) / zoom) ** 2;
+    let best = -1, bestD = r2;
+    nodes.forEach((n, i) => {{
+      const d = (n.x - w.x)**2 + (n.y - w.y)**2;
+      if (d < bestD) {{ bestD = d; best = i; }}
+    }});
+    return best;
+  }}
+
+  function showTip(ox, oy, text) {{
+    tooltip.style.display = 'block';
+    tooltip.style.left    = (ox + 16) + 'px';
+    tooltip.style.top     = Math.max(0, oy - 32) + 'px';
+    tooltip.textContent   = text;
+  }}
+  function hideTip() {{ tooltip.style.display = 'none'; }}
+
+  canvas.addEventListener('mousedown', e => {{
+    if (!initialized) return;
+    e.preventDefault();
+    const {{sx, sy}} = mousePos(e);
+    lastMouse = {{x: sx, y: sy}};
+    hasDragged = false;
+    dragIdx   = pickNode(sx, sy);
+    isPanning = dragIdx < 0;
+    canvas.style.cursor = 'grabbing';
+    if (!running) draw();
+  }});
+
+  canvas.addEventListener('mousemove', e => {{
+    if (!initialized) return;
+    const {{sx, sy, ox, oy}} = mousePos(e);
+    const dsx = sx - lastMouse.x, dsy = sy - lastMouse.y;
+    lastMouse = {{x: sx, y: sy}};
+    if (dragIdx >= 0 && (e.buttons & 1)) {{
+      hasDragged = hasDragged || Math.abs(dsx) > 2 || Math.abs(dsy) > 2;
+      const w = screenToWorld(sx, sy);
+      nodes[dragIdx].x = w.x; nodes[dragIdx].y = w.y;
+      nodes[dragIdx].vx = 0;  nodes[dragIdx].vy = 0;
+      showTip(ox, oy, nodes[dragIdx].url);
+      if (!running) draw();
+    }} else if (isPanning && (e.buttons & 1)) {{
+      hasDragged = true;
+      pan.x += dsx; pan.y += dsy;
+      if (!running) draw();
+    }} else {{
+      dragIdx = -1; isPanning = false;
+      const best = pickNode(sx, sy);
+      if (best !== hoveredIdx) {{ hoveredIdx = best; if (!running) draw(); }}
+      if (best >= 0) {{
+        showTip(ox, oy, nodes[best].url);
+        canvas.style.cursor = 'grab';
+      }} else {{
+        hideTip();
+        canvas.style.cursor = 'crosshair';
+      }}
+    }}
+  }});
+
+  canvas.addEventListener('mouseup', e => {{
+    if (dragIdx >= 0 && !hasDragged) window.open(nodes[dragIdx].url, '_blank');
+    dragIdx = -1; isPanning = false;
+    canvas.style.cursor = 'crosshair';
+  }});
+
+  canvas.addEventListener('mouseleave', () => {{
+    hoveredIdx = -1; dragIdx = -1; isPanning = false;
+    hideTip();
+    if (!running) draw();
+  }});
+
+  canvas.addEventListener('wheel', e => {{
+    if (!initialized) return;
+    e.preventDefault();
+    const {{sx, sy}} = mousePos(e);
+    const factor  = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+    const newZoom = Math.max(0.05, Math.min(12, zoom * factor));
+    const f = newZoom / zoom;
+    pan.x = sx + (pan.x - sx) * f;
+    pan.y = sy + (pan.y - sy) * f;
+    zoom  = newZoom;
+    if (!running) draw();
+  }}, {{passive: false}});
+
+  document.getElementById('topo-reset-btn').addEventListener('click', () => {{
+    if (!initialized) return;
+    pan  = {{x: canvas.width / 2, y: canvas.height / 2}};
+    zoom = 1.0;
+    if (!running) draw();
+  }});
+
+  function init() {{
+    if (initialized) return;
+    initialized = true;
+    resize();
+    initPositions();
+    running = true; alpha = 1.0;
+    loop();
+    setTimeout(() => {{ running = false; }}, 12000);
+  }}
+
+  details.addEventListener('toggle', () => {{ if (details.open) {{ init(); if (!running) draw(); }} }});
+  if (details.open) init();
+}})();
+"""
+
+    return f"""<details id="topo-details">
+  <summary class="blue">&#x1F578;&#xFE0F; Site Topology<span class="badge">{n_nodes} nodes / {n_edges} links</span></summary>
+  <div class="detail-body" style="padding:0.75rem 1.2rem 1rem;">
+    <p class="topo-info">
+      {n_nodes} nodes{capped} &nbsp;|&nbsp; {n_edges} directed links &nbsp;|&nbsp;
+      <strong>Drag node</strong> to reposition &nbsp;|&nbsp;
+      <strong>Drag canvas</strong> to pan &nbsp;|&nbsp;
+      <strong>Scroll</strong> to zoom &nbsp;|&nbsp;
+      <strong>Click node</strong> to open URL &nbsp;&nbsp;
+      <button id="topo-reset-btn" class="topo-btn">Reset view</button>
+    </p>
+    <div id="topo-wrap">
+      <canvas id="topo-canvas" style="cursor:crosshair;"></canvas>
+      <div id="topo-tooltip"></div>
+    </div>
+    <div class="topo-legend">
+      <span class="leg-start">Start URL</span>
+      <span class="leg-ok">200 OK</span>
+      <span class="leg-err">4xx / Error</span>
+      <span class="leg-warn">3xx Redirect</span>
+      <span class="leg-skip">Not fetched / Media</span>
+    </div>
+  </div>
+</details>
+<script>{js}</script>
+"""
 
 
 def generate_crawl_report_html(start_url: str, out_path: str):
@@ -696,6 +1087,8 @@ def generate_crawl_report_html(start_url: str, out_path: str):
     )
 
     # ── Assemble HTML ──────────────────────────────────────────────────────
+    topology_html = _generate_topology_html(base_host, start_url=start_url)
+
     sections = (
         _html_section("🔴 404 Not Found", items_404, "red") +
         _html_section("🟡 403 Forbidden", items_403, "yellow") +
@@ -719,6 +1112,7 @@ def generate_crawl_report_html(start_url: str, out_path: str):
   <h1>Crawl Report</h1>
   <p class="subtitle">Domain: <strong>{_html_module.escape(base_host)}</strong> &nbsp;|&nbsp; Generated: {timestamp}</p>
   <div class="stats-grid">{stats}</div>
+  {topology_html}
   {sections}
 </body>
 </html>"""
@@ -1447,18 +1841,44 @@ def run_xss_scan(start_url: str):
 # ---------------------------------------------------------------------------
 
 def recrawl(start_url: str, stay_on_domain: bool = True, workers: int = 1):
-    """Delete all DB entries for start_url's domain, then crawl fresh."""
+    """Delete all DB entries belonging to start_url's domain, then re-crawl.
+
+    Deletes:
+      - All pages whose URL belongs to base_host
+      - All external pages whose first referer was on base_host
+        (they were discovered exclusively during this domain's crawl)
+      - All findings and links touching base_host
+    Pages from other crawls (different domains, different referers) are kept.
+    """
     conn = get_db()
     base_host = urlparse(start_url).netloc
-    # Remove pages and findings belonging to this domain
-    pages = conn.execute("SELECT id, url FROM pages WHERE url LIKE ?", (f"%{base_host}%",)).fetchall()
-    ids_to_delete = [str(pid) for pid, url in pages if urlparse(url).netloc == base_host]
-    conn.execute(f"DELETE FROM pages WHERE url LIKE ?", (f"%{base_host}%",))
-    conn.execute(f"DELETE FROM findings WHERE url LIKE ?", (f"%{base_host}%",))
+
+    all_pages = conn.execute("SELECT id, url, referer FROM pages").fetchall()
+    ids_to_delete = [
+        pid for pid, url, referer in all_pages
+        if urlparse(url).netloc == base_host
+        or urlparse(referer).netloc == base_host
+    ]
+
+    if ids_to_delete:
+        ph = ",".join("?" * len(ids_to_delete))
+        conn.execute(f"DELETE FROM pages WHERE id IN ({ph})", ids_to_delete)
+
+    # Findings: keyed by URL, filter by domain
+    all_findings = conn.execute("SELECT id, url FROM findings").fetchall()
+    fids = [fid for fid, url in all_findings if urlparse(url).netloc == base_host]
+    if fids:
+        ph = ",".join("?" * len(fids))
+        conn.execute(f"DELETE FROM findings WHERE id IN ({ph})", fids)
+
+    # Links: canonical URLs contain the full netloc so LIKE is safe here
+    pattern = f"%{base_host}%"
+    conn.execute("DELETE FROM links WHERE source LIKE ? OR target LIKE ?", (pattern, pattern))
+
     conn.commit()
     conn.close()
 
-    print(C.yellow(f"[RECRAWL]") + f" Reset {len(ids_to_delete)} pages for {C.cyan(base_host)}")
+    print(C.yellow(f"[RECRAWL]") + f" Deleted {len(ids_to_delete)} pages for {C.cyan(base_host)}")
     crawl(start_url, stay_on_domain=stay_on_domain, workers=workers)
 
 
@@ -1538,15 +1958,24 @@ if __name__ == "__main__":
         _IGNORE_PATTERNS.extend(ignore_patterns)  # shared directly with worker threads
         print(C.yellow(f"[IGNORE]") + f" Active patterns: {ignore_patterns}")
 
-    # Parse --workers N (default 1)
+    # Parse --workers N  or  --workers=N
     workers = 1
-    if "--workers" in args:
-        idx = args.index("--workers")
-        try:
-            workers = max(1, int(args[idx + 1]))
-        except (IndexError, ValueError):
-            print(C.red("[ERROR]") + " --workers requires an integer argument")
-            sys.exit(1)
+    for _a in args:
+        if _a == "--workers":
+            _idx = args.index(_a)
+            try:
+                workers = max(1, int(args[_idx + 1]))
+            except (IndexError, ValueError):
+                print(C.red("[ERROR]") + " --workers requires an integer argument")
+                sys.exit(1)
+            break
+        if _a.startswith("--workers="):
+            try:
+                workers = max(1, int(_a.split("=", 1)[1]))
+            except ValueError:
+                print(C.red("[ERROR]") + " --workers requires an integer argument")
+                sys.exit(1)
+            break
 
     try:
         if "--recrawl" in args:
