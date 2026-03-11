@@ -823,9 +823,8 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
   let hasDragged  = false;
   let lastMouse   = {{x: 0, y: 0}};
   let ideal = 60;
-  let frameN = 0;
 
-  const MIN_ALPHA = 0.02;   // floor: simulation never fully stops
+  const MIN_ALPHA = 0.02;   // floor: physics pauses below this (see loop())
   const K_repel  = Math.max(800, 60000 / nodes.length);
   const K_spring = 0.035;
   const K_radial = 0.014;  // pulls each node toward its hop-distance shell
@@ -892,9 +891,7 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
   }}
 
   function tick() {{
-    frameN++;
-    const isHot = alpha > MIN_ALPHA * 1.5;
-    if (isHot) alpha *= 0.992; else alpha = MIN_ALPHA;
+    alpha = Math.max(MIN_ALPHA * 0.999, alpha * 0.992);  // cool toward zero; loop() stops calling tick() once at floor
 
     // Per-node initial force: shell attraction or weak center pull
     nodes.forEach((n, i) => {{
@@ -913,16 +910,14 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
       }}
     }});
 
-    // Repulsion: every frame when hot, every 4th frame when cool (saves CPU)
-    if (isHot || frameN % 4 === 0) {{
-      for (let i = 0; i < nodes.length; i++) {{
-        for (let j = i + 1; j < nodes.length; j++) {{
-          const dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
-          const d2 = dx*dx + dy*dy + 1, d = Math.sqrt(d2);
-          const f  = K_repel / d2;
-          nodes[i].fx += f*dx/d; nodes[i].fy += f*dy/d;
-          nodes[j].fx -= f*dx/d; nodes[j].fy -= f*dy/d;
-        }}
+    // Repulsion between all node pairs
+    for (let i = 0; i < nodes.length; i++) {{
+      for (let j = i + 1; j < nodes.length; j++) {{
+        const dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
+        const d2 = dx*dx + dy*dy + 1, d = Math.sqrt(d2);
+        const f  = K_repel / d2;
+        nodes[i].fx += f*dx/d; nodes[i].fy += f*dy/d;
+        nodes[j].fx -= f*dx/d; nodes[j].fy -= f*dy/d;
       }}
     }}
 
@@ -992,7 +987,13 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
     ctx.restore();
   }}
 
-  function loop() {{ tick(); draw(); requestAnimationFrame(loop); }}
+  function loop() {{
+    // Only run physics when still settling or user is dragging a node.
+    // When stable the draw loop stays alive for hover/pan/zoom responsiveness.
+    if (alpha > MIN_ALPHA || dragIdx >= 0) tick();
+    draw();
+    requestAnimationFrame(loop);
+  }}
 
   function mousePos(e) {{
     const rect = canvas.getBoundingClientRect();
