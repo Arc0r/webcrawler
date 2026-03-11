@@ -378,9 +378,32 @@ def _is_crawlable(url: str) -> bool:
     return True
 
 
+def _bs4_parse(html: str) -> "BeautifulSoup":
+    """Parse HTML tolerantly.
+
+    Python 3.14's stricter html.parser raises ValueError on malformed&#…;
+    entities (e.g. &#062ET2…).  We try lxml first (faster + lenient), then
+    fall back to html.parser after stripping the bad entities.
+    """
+    # 1) Try lxml – lenient and fast
+    try:
+        return BeautifulSoup(html, "lxml")
+    except Exception:
+        pass
+    # 2) Fall back: strip malformed numeric character references (&#<non-digit>…)
+    #    so html.parser doesn't choke on them.
+    cleaned = re.sub(r"&#(?![0-9]+;|x[0-9A-Fa-f]+;)", "&amp;#", html)
+    try:
+        return BeautifulSoup(cleaned, "html.parser")
+    except ValueError:
+        # Last resort: discard everything after the first bad entity
+        cleaned2 = re.sub(r"&#[^;]{0,30}(?!;)", " ", html)
+        return BeautifulSoup(cleaned2, "html.parser")
+
+
 def extract_links(html: str, base_url: str):
     """Return absolute URLs found in <a href=...> tags."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = _bs4_parse(html)
     links = set()
     for tag in soup.find_all("a", href=True):
         href = tag["href"].strip()
@@ -644,6 +667,7 @@ _HTML_STYLE = """
   .topo-legend .leg-warn::before { background: #d29922; }
   .topo-legend .leg-skip::before { background: #8b949e; }
   .topo-legend .leg-start::before { background: #f0b429; outline: 2px solid #fff; outline-offset: 1px; }
+  .topo-legend .leg-ext::before   { background: #a371f7; outline: 2px dashed #7c45c4; outline-offset: 1px; }
   .topo-btn { font-size:0.75rem; padding:0.15rem 0.6rem; border-radius:4px;
               border:1px solid var(--border); background:var(--surface);
               color:var(--text); cursor:pointer; }
@@ -664,7 +688,7 @@ def _html_section(title: str, items: list[str], color: str = "muted", open_by_de
     return f"<details{open_attr}>{header}{body}</details>"
 
 
-def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int = 600) -> str:
+def _generate_topology_html(base_host: str, start_url: str = "") -> str:
     """Build a self-contained canvas topology section (force-directed graph)."""
     conn = get_db()
     pages = conn.execute(
@@ -675,18 +699,26 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
 
     start_canonical = canonical_url(start_url) if start_url else ""
 
-    # Internal pages only, up to max_nodes (visited pages have priority)
+    # Split into internal and external pages
     internal = [
         (can, url, vis, sc, sr) for can, url, vis, sc, sr in pages
         if not base_host or urlparse(url).netloc == base_host
     ]
-    if len(internal) > max_nodes:
-        internal = sorted(internal, key=lambda x: -x[2])[:max_nodes]
+    external_all = [
+        (can, url, vis, sc, sr) for can, url, vis, sc, sr in pages
+        if base_host and urlparse(url).netloc != base_host
+    ]
+
+    max_ext = 500  # cap external nodes to avoid flooding the graph
+    if len(external_all) > max_ext:
+        external_all = external_all[:max_ext]
 
     if not internal:
         return ""
 
-    can_to_idx = {can: i for i, (can, *_) in enumerate(internal)}
+    # Build combined node list: internal first, then external
+    all_nodes = internal + external_all
+    can_to_idx = {can: i for i, (can, *_) in enumerate(all_nodes)}
 
     def _node_color(sc: int, sr: str, vis: int) -> str:
         # Not yet fetched (unvisited / filtered before fetch)
@@ -706,14 +738,21 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
             return "#3fb950"
         return "#8b949e"
 
+    def _node_label(url: str, is_ext: bool) -> str:
+        p = urlparse(url)
+        if is_ext:
+            return (p.netloc + (p.path or "/"))[:60]
+        return (p.path or "/")[:50]
+
     nodes_data = [
         {
             "url": url,
-            "label": (urlparse(url).path or "/")[:50],
-            "color": _node_color(sc, sr, vis),
+            "label": _node_label(url, i >= len(internal)),
+            "color": "#a371f7" if i >= len(internal) else _node_color(sc, sr, vis),
             "isStart": (can == start_canonical),
+            "isExternal": i >= len(internal),
         }
-        for can, url, vis, sc, sr in internal
+        for i, (can, url, vis, sc, sr) in enumerate(all_nodes)
     ]
 
     edges_data = []
@@ -727,11 +766,39 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
                 seen_edges.add(key)
                 edges_data.append({"s": si, "t": ti})
 
+    # Remove nodes that appear in no edge (orphans) – they were discovered but
+    # are not connected in the visible subgraph.  Always keep the start node.
+    connected: set[int] = set()
+    for e in edges_data:
+        connected.add(e["s"])
+        connected.add(e["t"])
+    start_idx_py = next(
+        (i for i, (can, *_) in enumerate(all_nodes) if can == start_canonical), -1
+    )
+    if start_idx_py >= 0:
+        connected.add(start_idx_py)
+
+    old_to_new: dict[int, int] = {}
+    nodes_data_filtered = []
+    for old_i, nd in enumerate(nodes_data):
+        if old_i in connected:
+            old_to_new[old_i] = len(nodes_data_filtered)
+            nodes_data_filtered.append(nd)
+    edges_data = [{"s": old_to_new[e["s"]], "t": old_to_new[e["t"]]} for e in edges_data]
+    nodes_data = nodes_data_filtered
+
+    # Explicitly mark the start node – safeguard against canonical mismatches after capping/filtering
+    if start_canonical:
+        for nd in nodes_data:
+            nd["isStart"] = (canonical_url(nd["url"]) == start_canonical)
+
     nodes_json = json.dumps(nodes_data)
     edges_json = json.dumps(edges_data)
     n_nodes = len(nodes_data)
+    n_ext = len(external_all)
     n_edges = len(edges_data)
-    capped = f" (capped at {max_nodes})" if len(internal) == max_nodes else ""
+    capped_ext = f" (ext capped at {max_ext})" if len(external_all) == max_ext else ""
+    capped = capped_ext
 
     js = f"""
 (function(){{
@@ -756,11 +823,36 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
   let hasDragged  = false;
   let lastMouse   = {{x: 0, y: 0}};
   let ideal = 60;
+  let frameN = 0;
 
+  const MIN_ALPHA = 0.02;   // floor: simulation never fully stops
   const K_repel  = Math.max(800, 60000 / nodes.length);
   const K_spring = 0.035;
-  const K_center = 0.003;
+  const K_radial = 0.014;  // pulls each node toward its hop-distance shell
+  const K_center = 0.001;  // weak fallback for nodes unreachable from start
   let   maxV     = ideal;  // velocity cap, updated after resize()
+
+  // ── BFS from start node to compute hop distances ──────────────────────
+  const startIdx = nodes.findIndex(n => n.isStart);
+  const hopDist  = new Array(nodes.length).fill(Infinity);
+  (function bfs() {{
+    if (startIdx < 0) return;
+    const adj = Array.from({{length: nodes.length}}, () => []);
+    edges.forEach(({{s, t}}) => {{
+      if (s < nodes.length && t < nodes.length) {{
+        adj[s].push(t); adj[t].push(s);
+      }}
+    }});
+    hopDist[startIdx] = 0;
+    const q = [startIdx];
+    for (let qi = 0; qi < q.length; qi++) {{
+      const cur = q[qi];
+      for (const nb of adj[cur]) {{
+        if (hopDist[nb] === Infinity) {{ hopDist[nb] = hopDist[cur] + 1; q.push(nb); }}
+      }}
+    }}
+  }})();
+  const maxHop = nodes.reduce((m, _, i) => hopDist[i] < Infinity ? Math.max(m, hopDist[i]) : m, 1);
 
   function resize() {{
     const w = canvas.parentElement.clientWidth || 900;
@@ -774,15 +866,23 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
   }}
 
   function initPositions() {{
-    // Fibonacci spiral: evenly distributes nodes across a disk so no two
-    // neighbours start absurdly close and cause a repulsion explosion.
-    const phi = Math.PI * (3 - Math.sqrt(5));  // golden angle ≈ 137.5°
-    const spread = Math.min(canvas.width, canvas.height) * 0.4;
+    // Place start node at world origin (= canvas centre after pan offset).
+    // All other nodes seeded on their BFS shell so the simulation starts
+    // close to the final radial layout and needs fewer ticks to settle.
+    const spread = Math.min(canvas.width, canvas.height) * 0.38;
+    const phi    = Math.PI * (3 - Math.sqrt(5));  // golden angle
+    let   j      = 0;  // counter for non-start nodes
     nodes.forEach((n, i) => {{
-      const r = spread * Math.sqrt((i + 0.5) / nodes.length);
-      const theta = phi * i;
-      n.x = r * Math.cos(theta);
-      n.y = r * Math.sin(theta);
+      if (i === startIdx) {{
+        n.x = 0; n.y = 0;
+      }} else {{
+        const h      = hopDist[i] < Infinity ? hopDist[i] : maxHop + 1;
+        const r      = spread * (h / (maxHop + 1)) + ideal * 0.5;
+        const theta  = phi * j;
+        n.x = r * Math.cos(theta);
+        n.y = r * Math.sin(theta);
+        j++;
+      }}
       n.vx = 0; n.vy = 0;
     }});
   }}
@@ -792,18 +892,41 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
   }}
 
   function tick() {{
-    if (alpha < 0.004) {{ running = false; return; }}
-    alpha *= 0.992;
-    nodes.forEach(n => {{ n.fx = -n.x * K_center; n.fy = -n.y * K_center; }});
-    for (let i = 0; i < nodes.length; i++) {{
-      for (let j = i + 1; j < nodes.length; j++) {{
-        const dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
-        const d2 = dx*dx + dy*dy + 1, d = Math.sqrt(d2);
-        const f  = K_repel / d2;
-        nodes[i].fx += f*dx/d; nodes[i].fy += f*dy/d;
-        nodes[j].fx -= f*dx/d; nodes[j].fy -= f*dy/d;
+    frameN++;
+    const isHot = alpha > MIN_ALPHA * 1.5;
+    if (isHot) alpha *= 0.992; else alpha = MIN_ALPHA;
+
+    // Per-node initial force: shell attraction or weak center pull
+    nodes.forEach((n, i) => {{
+      if (i === startIdx) {{ n.fx = 0; n.fy = 0; return; }}
+      if (hopDist[i] < Infinity) {{
+        // Pull toward target radial shell
+        const targetR = hopDist[i] * ideal * 1.15;
+        const curR    = Math.sqrt(n.x * n.x + n.y * n.y) || 1;
+        const k       = K_radial * (targetR - curR) / curR;
+        n.fx = k * n.x;
+        n.fy = k * n.y;
+      }} else {{
+        // Disconnected node: gentle gravity toward origin
+        n.fx = -n.x * K_center;
+        n.fy = -n.y * K_center;
+      }}
+    }});
+
+    // Repulsion: every frame when hot, every 4th frame when cool (saves CPU)
+    if (isHot || frameN % 4 === 0) {{
+      for (let i = 0; i < nodes.length; i++) {{
+        for (let j = i + 1; j < nodes.length; j++) {{
+          const dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
+          const d2 = dx*dx + dy*dy + 1, d = Math.sqrt(d2);
+          const f  = K_repel / d2;
+          nodes[i].fx += f*dx/d; nodes[i].fy += f*dy/d;
+          nodes[j].fx -= f*dx/d; nodes[j].fy -= f*dy/d;
+        }}
       }}
     }}
+
+    // Spring forces along edges
     edges.forEach(({{s, t}}) => {{
       if (s >= nodes.length || t >= nodes.length) return;
       const dx = nodes[t].x - nodes[s].x, dy = nodes[t].y - nodes[s].y;
@@ -813,8 +936,11 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
       nodes[s].fx += fx; nodes[s].fy += fy;
       nodes[t].fx -= fx; nodes[t].fy -= fy;
     }});
+
+    // Integrate velocities; start node is pinned at origin
     nodes.forEach((n, i) => {{
       if (i === dragIdx) return;
+      if (i === startIdx) {{ n.x = 0; n.y = 0; n.vx = 0; n.vy = 0; return; }}
       n.vx = Math.max(-maxV, Math.min(maxV, (n.vx + n.fx * alpha) * 0.65));
       n.vy = Math.max(-maxV, Math.min(maxV, (n.vy + n.fy * alpha) * 0.65));
       n.x += n.vx; n.y += n.vy;
@@ -836,9 +962,11 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
       ctx.stroke();
     }});
     nodes.forEach((n, i) => {{
-      const isActive = (i === hoveredIdx || i === dragIdx);
-      const isStart  = n.isStart;
-      const r = ((isStart ? rad + 5 : isActive ? rad + 3 : rad)) / zoom;
+      const isActive   = (i === hoveredIdx || i === dragIdx);
+      const isStart    = n.isStart;
+      const isExternal = n.isExternal;
+      const baseR = isExternal ? Math.max(2, rad - 2) : rad;
+      const r = ((isStart ? rad + 5 : isActive ? baseR + 3 : baseR)) / zoom;
       ctx.beginPath();
       ctx.arc(n.x, n.y, r, 0, 2 * Math.PI);
       ctx.fillStyle = isStart ? '#f0b429' : n.color;
@@ -848,6 +976,13 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
         ctx.strokeStyle = '#ffffff';
         ctx.lineWidth   = 2.5 / zoom;
         ctx.stroke();
+      }} else if (isExternal) {{
+        // Purple dashed ring for external nodes
+        ctx.strokeStyle = '#7c45c4';
+        ctx.lineWidth   = 1.2 / zoom;
+        ctx.setLineDash([3 / zoom, 3 / zoom]);
+        ctx.stroke();
+        ctx.setLineDash([]);
       }} else if (isActive) {{
         ctx.strokeStyle = '#e6edf3';
         ctx.lineWidth   = 1.5 / zoom;
@@ -857,7 +992,7 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
     ctx.restore();
   }}
 
-  function loop() {{ tick(); draw(); if (running) requestAnimationFrame(loop); }}
+  function loop() {{ tick(); draw(); requestAnimationFrame(loop); }}
 
   function mousePos(e) {{
     const rect = canvas.getBoundingClientRect();
@@ -887,6 +1022,18 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
   }}
   function hideTip() {{ tooltip.style.display = 'none'; }}
 
+  function centerOnStart() {{
+    if (startIdx < 0) return;
+    // Snap start node back to world origin in case it was manually dragged away
+    nodes[startIdx].x = 0; nodes[startIdx].y = 0;
+    nodes[startIdx].vx = 0; nodes[startIdx].vy = 0;
+    // Reset view so world (0,0) is at canvas centre with neutral zoom
+    zoom = 1.0;
+    pan  = {{x: canvas.width / 2, y: canvas.height / 2}};
+    // Re-energize so the graph re-settles around the re-centred start
+    alpha = Math.max(alpha, 0.5);
+  }}
+
   canvas.addEventListener('mousedown', e => {{
     if (!initialized) return;
     e.preventDefault();
@@ -895,8 +1042,8 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
     hasDragged = false;
     dragIdx   = pickNode(sx, sy);
     isPanning = dragIdx < 0;
+    if (dragIdx >= 0) alpha = Math.max(alpha, 0.5);  // re-energize on drag
     canvas.style.cursor = 'grabbing';
-    if (!running) draw();
   }});
 
   canvas.addEventListener('mousemove', e => {{
@@ -930,7 +1077,13 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
   }});
 
   canvas.addEventListener('mouseup', e => {{
-    if (dragIdx >= 0 && !hasDragged) window.open(nodes[dragIdx].url, '_blank');
+    if (dragIdx >= 0 && !hasDragged) {{
+      if (nodes[dragIdx].isStart) {{
+        centerOnStart();
+      }} else {{
+        window.open(nodes[dragIdx].url, '_blank');
+      }}
+    }}
     dragIdx = -1; isPanning = false;
     canvas.style.cursor = 'crosshair';
   }});
@@ -961,14 +1114,18 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
     if (!running) draw();
   }});
 
+  document.getElementById('topo-focus-start-btn').addEventListener('click', () => {{
+    if (!initialized) return;
+    centerOnStart();
+  }});
+
   function init() {{
     if (initialized) return;
     initialized = true;
     resize();
     initPositions();
-    running = true; alpha = 1.0;
-    loop();
-    setTimeout(() => {{ running = false; }}, 12000);
+    alpha = 1.0;
+    loop();  // runs indefinitely; throttles itself via MIN_ALPHA
   }}
 
   details.addEventListener('toggle', () => {{ if (details.open) {{ init(); if (!running) draw(); }} }});
@@ -980,12 +1137,14 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
   <summary class="blue">&#x1F578;&#xFE0F; Site Topology<span class="badge">{n_nodes} nodes / {n_edges} links</span></summary>
   <div class="detail-body" style="padding:0.75rem 1.2rem 1rem;">
     <p class="topo-info">
-      {n_nodes} nodes{capped} &nbsp;|&nbsp; {n_edges} directed links &nbsp;|&nbsp;
+      {n_nodes} nodes ({n_ext} external){capped} &nbsp;|&nbsp; {n_edges} directed links &nbsp;|&nbsp;
       <strong>Drag node</strong> to reposition &nbsp;|&nbsp;
       <strong>Drag canvas</strong> to pan &nbsp;|&nbsp;
       <strong>Scroll</strong> to zoom &nbsp;|&nbsp;
-      <strong>Click node</strong> to open URL &nbsp;&nbsp;
+      <strong>Click node</strong> to open URL &nbsp;|&nbsp;
+      <strong>Click golden circle</strong> to center it &nbsp;&nbsp;
       <button id="topo-reset-btn" class="topo-btn">Reset view</button>
+      <button id="topo-focus-start-btn" class="topo-btn">Focus start URL</button>
     </p>
     <div id="topo-wrap">
       <canvas id="topo-canvas" style="cursor:crosshair;"></canvas>
@@ -997,6 +1156,7 @@ def _generate_topology_html(base_host: str, start_url: str = "", max_nodes: int 
       <span class="leg-err">4xx / Error</span>
       <span class="leg-warn">3xx Redirect</span>
       <span class="leg-skip">Not fetched / Media</span>
+      <span class="leg-ext">External link</span>
     </div>
   </div>
 </details>
