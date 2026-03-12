@@ -355,6 +355,10 @@ _IGNORED_EXTENSIONS = {
 import fnmatch as _fnmatch
 _IGNORE_PATTERNS: list[str] = []
 
+# HTTP Basic Auth credentials set by --user / --password CLI options.
+# None means no authentication.
+_HTTP_AUTH: tuple[str, str] | None = None
+
 
 def _is_crawlable(url: str) -> bool:
     """Return False if the URL matches an ignored extension or user pattern.
@@ -449,7 +453,7 @@ def analyze_url(url: str, log=print):
 
     # ---- fetch page --------------------------------------------------------
     try:
-        resp = requests.get(url, timeout=10, verify=CA_BUNDLE, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"})
+        resp = requests.get(url, timeout=10, verify=CA_BUNDLE, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}, auth=_HTTP_AUTH)
         try:
             resp.raise_for_status()
         except requests.exceptions.HTTPError:
@@ -1676,6 +1680,7 @@ def run_advanced_scan(url: str, param: str | None = None):
         test_params_list = list(params.keys())
 
     HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}
+    AUTH = _HTTP_AUTH
     total_tests = (len(built_in_payloads) + len(wordlist_payloads)) * len(test_params_list)
 
     sep = C.bold("=" * 60)
@@ -1704,7 +1709,7 @@ def run_advanced_scan(url: str, param: str | None = None):
                 test_url = parsed._replace(query=urlencode(test_p)).geturl()
                 try:
                     resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
-                                        headers=HEADERS, allow_redirects=True)
+                                        headers=HEADERS, auth=AUTH, allow_redirects=True)
                     contexts = _check_reflection_context(resp.text, canary, payload)
                     if not contexts:
                         print(C.green("  [safe]") + f" [{label}]")
@@ -1731,7 +1736,7 @@ def run_advanced_scan(url: str, param: str | None = None):
                 test_url = parsed._replace(query=urlencode(test_p)).geturl()
                 try:
                     resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
-                                        headers=HEADERS, allow_redirects=True)
+                                        headers=HEADERS, auth=AUTH, allow_redirects=True)
                     if payload in resp.text:
                         contexts = _check_xss_context(resp.text, payload)
                         for desc, exploitable in contexts:
@@ -1835,6 +1840,7 @@ def run_xss_scan(start_url: str):
     stored_hits:   list[str] = []          # pages where canary was found after injection
 
     HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}
+    AUTH = _HTTP_AUTH
 
     try:
         # ── Phase 1: Reflected XSS ───────────────────────────────────────────
@@ -1857,7 +1863,7 @@ def run_xss_scan(start_url: str):
 
                     try:
                         resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
-                                            headers=HEADERS, allow_redirects=True)
+                                            headers=HEADERS, auth=AUTH, allow_redirects=True)
                         contexts = _check_reflection_context(resp.text, canary, payload)
 
                         if not contexts:
@@ -1885,7 +1891,7 @@ def run_xss_scan(start_url: str):
                     test_url = parsed._replace(query=urlencode(test_params)).geturl()
                     try:
                         resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
-                                            headers=HEADERS, allow_redirects=True)
+                                            headers=HEADERS, auth=AUTH, allow_redirects=True)
                         if payload in resp.text:
                             contexts = _check_xss_context(resp.text, payload)
                             for desc, exploitable in contexts:
@@ -1910,7 +1916,7 @@ def run_xss_scan(start_url: str):
         for page_url in all_visited:
             try:
                 resp = requests.get(page_url, timeout=10, verify=CA_BUNDLE,
-                                    headers=HEADERS, allow_redirects=True)
+                                    headers=HEADERS, auth=AUTH, allow_redirects=True)
                 if canary in resp.text:
                     contexts = _check_reflection_context(resp.text, canary, canary)
                     for desc, exploitable in contexts:
@@ -2061,6 +2067,8 @@ def show_help():
   {C.cyan('--recrawl')}           Reset DB for start_url's domain and re-crawl
   {C.cyan('--xss')}               Run reflected/stored XSS tests on stored URLs
   {C.cyan('--advancedscan URL')}  Run ALL xss.txt payloads on URL (+ optional param name)
+  {C.cyan('--user USER')}         HTTP Basic Auth username (for htaccess-protected sites)
+  {C.cyan('--password PASS')}     HTTP Basic Auth password
   {C.cyan('--help')}              Show this help
 
 {C.bold('--ignore examples:')}
@@ -2079,6 +2087,7 @@ def show_help():
   python {prog} https://example.com --all-domains
   python {prog} --advancedscan "http://localhost/xss.php?test=foo"
   python {prog} --advancedscan "http://localhost/xss.php?test=foo" test
+  python {prog} https://example.com --user admin --password secret
 """)
 
 
@@ -2109,6 +2118,24 @@ if __name__ == "__main__":
     print(f"[LOG] Output mirrored to {log_path}")
 
     stay = "--all-domains" not in args
+
+    # Parse --user / --password for HTTP Basic Auth
+    import getpass
+    http_user: str | None = None
+    http_password: str | None = None
+    for i, a in enumerate(args):
+        if a == "--user" and i + 1 < len(args):
+            http_user = args[i + 1]
+        elif a == "--password" and i + 1 < len(args):
+            http_password = args[i + 1]
+    if http_user is not None and http_password is None:
+        http_password = getpass.getpass(f"Password for '{http_user}': ")
+    if http_user is not None and http_password is not None:
+        _HTTP_AUTH = (http_user, http_password)
+        print(C.yellow(f"[AUTH]") + f" HTTP Basic Auth enabled for user '{http_user}'")
+    elif http_user is not None or http_password is not None:
+        print(C.red("[ERROR]") + " Both --user and --password must be provided together")
+        sys.exit(1)
 
     # Parse --ignore PATTERN (repeatable)
     ignore_patterns: list[str] = []

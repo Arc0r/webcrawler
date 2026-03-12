@@ -17,6 +17,7 @@ A web crawler and XSS scanner written in Python. Crawls a target domain, discove
 - Colour-coded terminal output
 - All output is simultaneously saved to `results/<domain>.txt` (ANSI codes stripped)
 - Skips non-HTML content (videos, PDFs, etc.) automatically
+- **HTTP Basic Auth** support via `--user` / `--password` for htaccess-protected sites (password can be entered interactively with hidden input)
 - **HTML Crawl Report** generated automatically after every crawl (`results/<domain>_crawl_report.html`)
   - Includes an interactive **Site Topology graph** (force-directed canvas visualization)
 - **HTML XSS Report** generated automatically after every XSS scan (`results/<domain>_xss_report.html`)
@@ -68,6 +69,8 @@ python main.py <start_url> [options]
 | `--recrawl` | Reset DB entries for the domain and re-crawl from scratch |
 | `--xss` | Run XSS scan against previously crawled parameterised URLs |
 | `--advancedscan URL [param]` | Run the full `xss.txt` wordlist + built-in payloads against a single URL; no crawl required |
+| `--user USER` | HTTP Basic Auth username (for htaccess-protected sites) |
+| `--password PASS` | HTTP Basic Auth password (omit to be prompted securely) |
 | `--help` | Show usage |
 
 ### `--ignore` patterns
@@ -114,7 +117,27 @@ python main.py --advancedscan "http://example.com/search.php?q=test"
 
 # Same, but only test the "q" parameter
 python main.py --advancedscan "http://example.com/search.php?q=test" q
+
+# Crawl a password-protected site (will prompt for password)
+python main.py https://example.com/protected/ --user admin
 ```
+
+### HTTP Basic Auth (`--user` / `--password`)
+
+For sites protected by HTTP Basic Authentication (htaccess), pass credentials with `--user` and optionally `--password`. If `--password` is omitted, you will be prompted to enter it interactively — the input is hidden so the password never appears in the terminal.
+
+```bash
+# Prompt for password (hidden input)
+python main.py https://example.com/protected/ --user admin
+
+# Pass password directly (e.g. in scripts)
+python main.py https://example.com/protected/ --user admin --password secret
+
+# Works with all modes — crawl, XSS scan, advanced scan
+python main.py https://example.com/protected/ --user admin --xss
+```
+
+Credentials are sent as an HTTP `Authorization: Basic ...` header on every request.
 
 ---
 
