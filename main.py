@@ -831,6 +831,7 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
   let running     = false;
   let alpha       = 1.0;
   let hoveredIdx  = -1;
+  let searchedIdx = -1;
   let dragIdx     = -1;
   let isPanning   = false;
   let hasDragged  = false;
@@ -997,6 +998,17 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
         ctx.stroke();
       }}
     }});
+    // Pulsing highlight ring for searched node
+    if (searchedIdx >= 0 && searchedIdx < nodes.length) {{
+      const _sn = nodes[searchedIdx];
+      ctx.beginPath();
+      ctx.arc(_sn.x, _sn.y, (rad + 10) / zoom, 0, 2 * Math.PI);
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth   = 2.5 / zoom;
+      ctx.setLineDash([4 / zoom, 4 / zoom]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    }}
     ctx.restore();
   }}
 
@@ -1046,6 +1058,15 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
     pan  = {{x: canvas.width / 2, y: canvas.height / 2}};
     // Re-energize so the graph re-settles around the re-centred start
     alpha = Math.max(alpha, 0.5);
+  }}
+
+  function focusNode(idx) {{
+    if (idx < 0 || idx >= nodes.length) return;
+    searchedIdx = idx;
+    const n = nodes[idx];
+    zoom = Math.max(3.0, zoom);
+    pan  = {{x: canvas.width / 2 - n.x * zoom, y: canvas.height / 2 - n.y * zoom}};
+    draw();
   }}
 
   canvas.addEventListener('mousedown', e => {{
@@ -1133,6 +1154,21 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
     centerOnStart();
   }});
 
+  document.getElementById('topo-search-btn').addEventListener('click', () => {{
+    if (!initialized) return;
+    const q = document.getElementById('topo-search').value.trim().toLowerCase();
+    const res = document.getElementById('topo-search-result');
+    if (!q) {{ searchedIdx = -1; res.textContent = ''; draw(); return; }}
+    const idx = nodes.findIndex(n => n.url.toLowerCase().includes(q));
+    if (idx < 0) {{ searchedIdx = -1; res.textContent = 'No match found.'; draw(); return; }}
+    focusNode(idx);
+    res.textContent = nodes[idx].url;
+  }});
+
+  document.getElementById('topo-search').addEventListener('keydown', e => {{
+    if (e.key === 'Enter') document.getElementById('topo-search-btn').click();
+  }});
+
   function init() {{
     if (initialized) return;
     initialized = true;
@@ -1159,6 +1195,10 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
       <strong>Click golden circle</strong> to center it &nbsp;&nbsp;
       <button id="topo-reset-btn" class="topo-btn">Reset view</button>
       <button id="topo-focus-start-btn" class="topo-btn">Focus start URL</button>
+      &nbsp;&nbsp;
+      <input id="topo-search" type="text" placeholder="Search URL…" style="font-size:0.75rem;padding:0.15rem 0.5rem;border-radius:4px;border:1px solid var(--border);background:var(--surface);color:var(--text);width:280px;">
+      <button id="topo-search-btn" class="topo-btn">Find</button>
+      <span id="topo-search-result" style="display:block;font-size:0.72rem;color:var(--muted);margin-top:0.25rem;word-break:break-all;"></span>
     </p>
     <div id="topo-wrap">
       <canvas id="topo-canvas" style="cursor:crosshair;"></canvas>
@@ -1190,6 +1230,7 @@ def generate_crawl_report_html(start_url: str, out_path: str):
     findings = conn.execute(
         "SELECT url, param, value FROM findings ORDER BY url, param"
     ).fetchall()
+    link_rows = conn.execute("SELECT source, target FROM links").fetchall()
     conn.close()
 
     # Partition pages
@@ -1238,7 +1279,41 @@ def generate_crawl_report_html(start_url: str, out_path: str):
     items_media = [f'<span class="tag muted">{_html_module.escape(ct)}</span>{_url_link(u)}' for u, ct in pages_media]
     items_error    = [f'<span class="tag red">error</span>{_url_link(u)}<span class="param-row">{_html_module.escape(e[:120])}</span>' for u, e in pages_error]
     items_redirect = [f'{_url_link(u)}<span class="param-row">↗ {_html_module.escape(t)}</span>' for u, t in pages_redirect]
-    items_ext      = [_url_link(u) for u in sorted(set(pages_external))]
+
+    # Build external URL → list of internal pages that link to it
+    can_to_url: dict[str, str] = {canonical_url(u): u for u, *_ in all_pages}
+    ext_referrers: dict[str, list[str]] = {}
+    for src_can, tgt_can in link_rows:
+        src_url = can_to_url.get(src_can)
+        tgt_url = can_to_url.get(tgt_can)
+        if not src_url or not tgt_url:
+            continue
+        if base_host and urlparse(tgt_url).netloc != base_host and urlparse(src_url).netloc == base_host:
+            refs = ext_referrers.setdefault(tgt_url, [])
+            if src_url not in refs:
+                refs.append(src_url)
+
+    def _ext_item(ext_url: str) -> str:
+        link = _url_link(ext_url)
+        refs = ext_referrers.get(ext_url, [])
+        if not refs:
+            return link
+        ref_rows = "".join(
+            f'<li style="padding:0.15rem 0;"><small>{_url_link(r)}</small></li>'
+            for r in sorted(refs)
+        )
+        n_refs = len(refs)
+        label = f'&#9656; linked from {n_refs} internal page{"s" if n_refs != 1 else ""}'
+        return (
+            f'{link}'
+            f'<details style="margin-top:0.25rem;">'
+            f'<summary style="font-size:0.78rem;color:var(--muted);padding:0.15rem 0;'
+            f'list-style:none;cursor:pointer;user-select:none;">{label}</summary>'
+            f'<ul style="list-style:none;padding:0.25rem 0 0 1.2rem;">{ref_rows}</ul>'
+            f'</details>'
+        )
+
+    items_ext      = [_ext_item(u) for u in sorted(set(pages_external))]
     items_ok       = [_url_link(u) for u in pages_ok]
 
     # GET param items: one collapsible entry per URL
@@ -2083,7 +2158,7 @@ def show_help():
   {C.cyan('--xss')}               Run reflected/stored XSS tests on stored URLs
   {C.cyan('--advancedscan URL')}  Run ALL xss.txt payloads on URL (+ optional param name)
   {C.cyan('--user USER')}         HTTP Basic Auth username (for htaccess-protected sites)
-  {C.cyan('--password PASS')}     HTTP Basic Auth password
+  {C.cyan('--password PASS')}     HTTP Basic Auth password (blank to prompt securely), needs to be last argument
   {C.cyan('--help')}              Show this help
 
 {C.bold('--ignore examples:')}
