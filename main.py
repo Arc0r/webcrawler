@@ -192,7 +192,7 @@ DB_FILE = "crawler.db"
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")       # allow concurrent writes from worker threads
-    conn.execute("PRAGMA busy_timeout = 5000")  # retry up to 5 s on lock contention
+    conn.execute("PRAGMA busy_timeout = 30000")  # retry up to 30 s on lock contention
     conn.execute(
         """CREATE TABLE IF NOT EXISTS pages (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -463,6 +463,14 @@ def analyze_url(url: str, log=print):
             mark_visited(conn, url)
             conn.close()
             return
+        # If the server redirected us to a different host/subdomain, treat it
+        # as an external redirect and do not extract links from the foreign page.
+        if urlparse(resp.url).netloc != urlparse(url).netloc:
+            log(C.yellow(f"  [EXT-REDIRECT]") + f" {url} → {resp.url}")
+            set_page_status(conn, url, resp.status_code, f"redirect:{resp.url}")
+            mark_visited(conn, url)
+            conn.close()
+            return
         content_type = resp.headers.get("Content-Type", "")
         if "html" not in content_type:
             ct_short = content_type.split(";")[0].strip()
@@ -500,6 +508,7 @@ def analyze_url(url: str, log=print):
         save_link(conn, url, link)
 
     log(f"  [LINKS] found {len(links)} links, " + C.green(f"{new_count} new"))
+    conn.commit()  # flush all link/url/finding inserts; releases write lock for other workers
 
     # ---- mark as done ------------------------------------------------------
     mark_visited(conn, url)
@@ -1185,7 +1194,7 @@ def generate_crawl_report_html(start_url: str, out_path: str):
 
     # Partition pages
     pages_404, pages_403, pages_other_err, pages_media, pages_error = [], [], [], [], []
-    pages_ok, pages_external = [], []
+    pages_ok, pages_external, pages_redirect = [], [], []
 
     for url, visited, status_code, skip_reason in all_pages:
         is_internal = not base_host or urlparse(url).netloc == base_host
@@ -1203,6 +1212,9 @@ def generate_crawl_report_html(start_url: str, out_path: str):
             pages_media.append((url, ct))
         elif skip_reason.startswith("error:"):
             pages_error.append((url, skip_reason[len("error:"):]))
+        elif skip_reason.startswith("redirect:"):
+            target = skip_reason[len("redirect:"):]
+            pages_redirect.append((url, target))
         elif visited:
             pages_ok.append(url)
 
@@ -1212,7 +1224,7 @@ def generate_crawl_report_html(start_url: str, out_path: str):
         if not base_host or urlparse(url).netloc == base_host:
             params_by_url.setdefault(url, []).append((param, value))
 
-    total_crawled = len(pages_ok) + len(pages_404) + len(pages_403) + len(pages_other_err) + len(pages_media) + len(pages_error)
+    total_crawled = len(pages_ok) + len(pages_404) + len(pages_403) + len(pages_other_err) + len(pages_media) + len(pages_error) + len(pages_redirect)
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # ── Build section items ────────────────────────────────────────────────
@@ -1224,9 +1236,10 @@ def generate_crawl_report_html(start_url: str, out_path: str):
     items_403   = [_url_link(u) for u in pages_403]
     items_other = [f'<span class="tag red">HTTP {sc}</span>{_url_link(u)}' for u, sc in pages_other_err]
     items_media = [f'<span class="tag muted">{_html_module.escape(ct)}</span>{_url_link(u)}' for u, ct in pages_media]
-    items_error = [f'<span class="tag red">error</span>{_url_link(u)}<span class="param-row">{_html_module.escape(e[:120])}</span>' for u, e in pages_error]
-    items_ext   = [_url_link(u) for u in sorted(set(pages_external))]
-    items_ok    = [_url_link(u) for u in pages_ok]
+    items_error    = [f'<span class="tag red">error</span>{_url_link(u)}<span class="param-row">{_html_module.escape(e[:120])}</span>' for u, e in pages_error]
+    items_redirect = [f'{_url_link(u)}<span class="param-row">↗ {_html_module.escape(t)}</span>' for u, t in pages_redirect]
+    items_ext      = [_url_link(u) for u in sorted(set(pages_external))]
+    items_ok       = [_url_link(u) for u in pages_ok]
 
     # GET param items: one collapsible entry per URL
     param_items = []
@@ -1247,6 +1260,7 @@ def generate_crawl_report_html(start_url: str, out_path: str):
         _card("404 errors", len(pages_404), "red" if pages_404 else "green") +
         _card("403 forbidden", len(pages_403), "yellow" if pages_403 else "green") +
         _card("Media skipped", len(pages_media), "muted") +
+        _card("Ext. redirects", len(pages_redirect), "yellow" if pages_redirect else "green") +
         _card("External links", len(set(pages_external)), "blue") +
         _card("URLs w/ params", len(params_by_url), "yellow" if params_by_url else "green")
     )
@@ -1260,6 +1274,7 @@ def generate_crawl_report_html(start_url: str, out_path: str):
         _html_section("⚠️ Other HTTP Errors", items_other, "red") +
         _html_section("🎞️ Media / Non-HTML (skipped)", items_media, "muted") +
         _html_section("❌ Fetch Errors", items_error, "red") +
+        _html_section("↗️ Cross-subdomain Redirects (not crawled)", items_redirect, "yellow") +
         _html_section("🔗 External Links", items_ext, "blue") +
         _html_section("🔍 URLs with GET Parameters", param_items, "yellow", open_by_default=bool(param_items)) +
         _html_section("✅ Successfully Crawled Pages", items_ok, "green")
