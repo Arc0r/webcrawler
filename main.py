@@ -17,8 +17,10 @@ from bs4 import BeautifulSoup
 # Tee: write stdout to file AND terminal simultaneously
 # ---------------------------------------------------------------------------
 
+
 class _Tee:
     """Wraps sys.stdout to mirror all output into a log file."""
+
     def __init__(self, filepath: str):
         global _tee_instance
         self._term = sys.__stdout__
@@ -29,6 +31,7 @@ class _Tee:
         self._term.write(data)
         # Strip ANSI color codes for the file
         import re
+
         self._file.write(re.sub(r"\033\[[0-9;]*m", "", data))
 
     def flush(self):
@@ -41,10 +44,12 @@ class _Tee:
     def fileno(self):
         return self._term.fileno()
 
+
 # Global tee reference so worker threads can write to the log file without
 # printing to the terminal (keeps the dashboard display clean).
 _tee_instance: "_Tee | None" = None
 _worker_log_lock = threading.Lock()
+
 
 def _worker_log(*args, **kwargs):
     """Write to the log file only – bypasses the terminal so the dashboard
@@ -61,36 +66,50 @@ def _worker_log(*args, **kwargs):
             sys.__stdout__.write(msg + end)
             sys.__stdout__.flush()
 
+
 # ---------------------------------------------------------------------------
 # Colors
 # ---------------------------------------------------------------------------
 
+
 class C:
-    RED    = "\033[91m"
-    GREEN  = "\033[92m"
+    RED = "\033[91m"
+    GREEN = "\033[92m"
     YELLOW = "\033[93m"
-    CYAN   = "\033[96m"
-    MAGENTA= "\033[95m"
-    BOLD   = "\033[1m"
-    RESET  = "\033[0m"
+    CYAN = "\033[96m"
+    MAGENTA = "\033[95m"
+    BOLD = "\033[1m"
+    RESET = "\033[0m"
 
     @staticmethod
-    def red(s):     return f"{C.RED}{s}{C.RESET}"
+    def red(s):
+        return f"{C.RED}{s}{C.RESET}"
+
     @staticmethod
-    def green(s):   return f"{C.GREEN}{s}{C.RESET}"
+    def green(s):
+        return f"{C.GREEN}{s}{C.RESET}"
+
     @staticmethod
-    def yellow(s):  return f"{C.YELLOW}{s}{C.RESET}"
+    def yellow(s):
+        return f"{C.YELLOW}{s}{C.RESET}"
+
     @staticmethod
-    def cyan(s):    return f"{C.CYAN}{s}{C.RESET}"
+    def cyan(s):
+        return f"{C.CYAN}{s}{C.RESET}"
+
     @staticmethod
-    def magenta(s): return f"{C.MAGENTA}{s}{C.RESET}"
+    def magenta(s):
+        return f"{C.MAGENTA}{s}{C.RESET}"
+
     @staticmethod
-    def bold(s):    return f"{C.BOLD}{s}{C.RESET}"
+    def bold(s):
+        return f"{C.BOLD}{s}{C.RESET}"
 
 
 # ---------------------------------------------------------------------------
 # Dashboard – live 3-line progress display during crawl
 # ---------------------------------------------------------------------------
+
 
 class Dashboard:
     """Renders a compact 3-line dashboard in-place on the real terminal."""
@@ -98,10 +117,10 @@ class Dashboard:
     LINES = 3  # number of lines the dashboard occupies
 
     def __init__(self, site: str):
-        self._site     = site
-        self._lock     = threading.Lock()
-        self._scanned  = 0
-        self._total    = 0
+        self._site = site
+        self._lock = threading.Lock()
+        self._scanned = 0
+        self._total = 0
         self._rendered = False
         self._finalized = False
         self._bar_width = 50
@@ -117,18 +136,18 @@ class Dashboard:
             if self._finalized:
                 return
             self._scanned = scanned
-            self._total   = total
+            self._total = total
             self._render_locked()
 
     def _render_locked(self):
         """Render (must be called with self._lock held)."""
         bar_width = self._bar_width
-        total     = self._total
-        scanned   = self._scanned
+        total = self._total
+        scanned = self._scanned
 
         filled = int(bar_width * scanned / total) if total > 0 else 0
-        empty  = bar_width - filled
-        pct    = scanned / total * 100 if total > 0 else 0
+        empty = bar_width - filled
+        pct = scanned / total * 100 if total > 0 else 0
 
         bar_str = f"{C.GREEN}{'#' * filled}{C.RESET}{'-' * empty}"
 
@@ -142,7 +161,7 @@ class Dashboard:
             self._write(f"\033[{self.LINES}A")  # move cursor up N lines
 
         for line in lines:
-            self._write(f"\r\033[K{line}\n")    # clear line, print, newline
+            self._write(f"\r\033[K{line}\n")  # clear line, print, newline
 
         self._rendered = True
 
@@ -165,17 +184,21 @@ class Dashboard:
 #   cat /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem /tmp/int.pem > ca-bundle-custom.pem
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _SYSTEM_CA_PATHS = [
-    os.path.join(_SCRIPT_DIR, "ca-bundle-custom.pem"),    # local custom bundle (highest priority)
+    os.path.join(
+        _SCRIPT_DIR, "ca-bundle-custom.pem"
+    ),  # local custom bundle (highest priority)
     "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  # Fedora / RHEL
-    "/etc/ssl/certs/ca-certificates.crt",                  # Debian / Ubuntu
-    "/etc/ssl/cert.pem",                                   # Alpine / macOS
+    "/etc/ssl/certs/ca-certificates.crt",  # Debian / Ubuntu
+    "/etc/ssl/cert.pem",  # Alpine / macOS
 ]
+
 
 def _find_ca_bundle():
     for path in _SYSTEM_CA_PATHS:
         if os.path.isfile(path):
             return path
     return True  # fall back to certifi
+
 
 CA_BUNDLE = _find_ca_bundle()
 
@@ -191,7 +214,9 @@ DB_FILE = "crawler.db"
 
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")       # allow concurrent writes from worker threads
+    conn.execute(
+        "PRAGMA journal_mode=WAL"
+    )  # allow concurrent writes from worker threads
     conn.execute("PRAGMA busy_timeout = 30000")  # retry up to 30 s on lock contention
     conn.execute(
         """CREATE TABLE IF NOT EXISTS pages (
@@ -234,9 +259,13 @@ def get_db():
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_pages_canonical ON pages (canonical)"
         )
     if "status_code" not in cols:
-        conn.execute("ALTER TABLE pages ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            "ALTER TABLE pages ADD COLUMN status_code INTEGER NOT NULL DEFAULT 0"
+        )
     if "skip_reason" not in cols:
-        conn.execute("ALTER TABLE pages ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            "ALTER TABLE pages ADD COLUMN skip_reason TEXT NOT NULL DEFAULT ''"
+        )
     if "referer" not in cols:
         conn.execute("ALTER TABLE pages ADD COLUMN referer TEXT NOT NULL DEFAULT ''")
     # Create links table for topology (idempotent)
@@ -261,7 +290,9 @@ def add_url(conn: sqlite3.Connection, url: str, referer: str = ""):
 
 
 def mark_visited(conn: sqlite3.Connection, url: str):
-    conn.execute("UPDATE pages SET visited = 1 WHERE canonical = ?", (canonical_url(url),))
+    conn.execute(
+        "UPDATE pages SET visited = 1 WHERE canonical = ?", (canonical_url(url),)
+    )
     conn.commit()
 
 
@@ -295,7 +326,9 @@ def save_link(conn: sqlite3.Connection, source: str, target: str):
     )
 
 
-def set_page_status(conn: sqlite3.Connection, url: str, status_code: int, skip_reason: str = ""):
+def set_page_status(
+    conn: sqlite3.Connection, url: str, status_code: int, skip_reason: str = ""
+):
     """Record the HTTP status code and optional skip reason for a page."""
     conn.execute(
         "UPDATE pages SET status_code = ?, skip_reason = ? WHERE canonical = ?",
@@ -338,21 +371,64 @@ def same_domain(base_url: str, url: str) -> bool:
 
 _IGNORED_EXTENSIONS = {
     # media
-    ".mp4", ".m4v", ".mkv", ".avi", ".mov", ".wmv", ".flv", ".webm",
-    ".mp3", ".ogg", ".wav", ".flac", ".aac",
+    ".mp4",
+    ".m4v",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".mp3",
+    ".ogg",
+    ".wav",
+    ".flac",
+    ".aac",
     # images
-    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".svg", ".webp", ".ico", ".tif", ".tiff",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".svg",
+    ".webp",
+    ".ico",
+    ".tif",
+    ".tiff",
     # documents
-    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".xls",
+    ".xlsx",
+    ".ppt",
+    ".pptx",
+    ".odt",
+    ".ods",
     # archives
-    ".zip", ".tar", ".gz", ".bz2", ".xz", ".rar", ".7z",
+    ".zip",
+    ".tar",
+    ".gz",
+    ".bz2",
+    ".xz",
+    ".rar",
+    ".7z",
     # code / data
-    ".js", ".css", ".json", ".xml", ".csv", ".woff", ".woff2", ".ttf", ".eot",
+    ".js",
+    ".css",
+    ".json",
+    ".xml",
+    ".csv",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
 }
 
 # Ignore patterns set by CLI before crawl starts; shared across all worker threads.
 # Append to this list in __main__ instead of using env vars.
 import fnmatch as _fnmatch
+
 _IGNORE_PATTERNS: list[str] = []
 
 # HTTP Basic Auth credentials set by --user / --password CLI options.
@@ -374,7 +450,7 @@ def _is_crawlable(url: str) -> bool:
     url_params = set(parse_qs(urlparse(url).query).keys())
     for pat in _IGNORE_PATTERNS:
         if pat.startswith("param:"):
-            param_name = pat[len("param:"):]
+            param_name = pat[len("param:") :]
             if param_name in url_params:
                 return False
         elif _fnmatch.fnmatch(url, pat) or pat in url:
@@ -430,6 +506,7 @@ def extract_get_params(url: str):
 # Analyzer – runs inside each worker thread
 # ---------------------------------------------------------------------------
 
+
 def analyze_url(url: str, log=print):
     """
     Fetch *url*, record GET params, and store newly discovered links in the DB.
@@ -453,7 +530,15 @@ def analyze_url(url: str, log=print):
 
     # ---- fetch page --------------------------------------------------------
     try:
-        resp = requests.get(url, timeout=10, verify=CA_BUNDLE, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}, auth=_HTTP_AUTH)
+        resp = requests.get(
+            url,
+            timeout=10,
+            verify=CA_BUNDLE,
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
+            },
+            auth=_HTTP_AUTH,
+        )
         try:
             resp.raise_for_status()
         except requests.exceptions.HTTPError:
@@ -502,7 +587,10 @@ def analyze_url(url: str, log=print):
             if link_params:
                 for param, values in link_params.items():
                     for val in values:
-                        log(C.yellow(f"  [GET PARAM in link]") + f" {param}={val}  (url: {link})")
+                        log(
+                            C.yellow(f"  [GET PARAM in link]")
+                            + f" {param}={val}  (url: {link})"
+                        )
                         save_finding(conn, link, param, val)
         # Always record the directed link for topology (duplicates ignored by DB)
         save_link(conn, url, link)
@@ -519,7 +607,10 @@ def analyze_url(url: str, log=print):
 # Crawler (main loop)
 # ---------------------------------------------------------------------------
 
-def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5, workers: int = 1):
+
+def crawl(
+    start_url: str, stay_on_domain: bool = True, delay: float = 0.5, workers: int = 1
+):
     conn = get_db()
     add_url(conn, start_url)
     conn.commit()  # flush the seed URL so workers can see it immediately
@@ -531,8 +622,10 @@ def crawl(start_url: str, stay_on_domain: bool = True, delay: float = 0.5, worke
     def _get_stats() -> tuple[int, int]:
         """Return (scanned, total) from the DB under the lock."""
         with _db_lock:
-            total   = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-            scanned = conn.execute("SELECT COUNT(*) FROM pages WHERE visited = 1").fetchone()[0]
+            total = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+            scanned = conn.execute(
+                "SELECT COUNT(*) FROM pages WHERE visited = 1"
+            ).fetchone()[0]
         return scanned, total
 
     def _claim_next() -> str | None:
@@ -688,7 +781,10 @@ _HTML_STYLE = """
 </style>
 """
 
-def _html_section(title: str, items: list[str], color: str = "muted", open_by_default: bool = False) -> str:
+
+def _html_section(
+    title: str, items: list[str], color: str = "muted", open_by_default: bool = False
+) -> str:
     """Render a collapsible <details> section with an <ul> of raw HTML item strings."""
     open_attr = " open" if open_by_default else ""
     badge = f'<span class="badge">{len(items)}</span>'
@@ -714,11 +810,13 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
 
     # Split into internal and external pages
     internal = [
-        (can, url, vis, sc, sr) for can, url, vis, sc, sr in pages
+        (can, url, vis, sc, sr)
+        for can, url, vis, sc, sr in pages
         if not base_host or urlparse(url).netloc == base_host
     ]
     external_all = [
-        (can, url, vis, sc, sr) for can, url, vis, sc, sr in pages
+        (can, url, vis, sc, sr)
+        for can, url, vis, sc, sr in pages
         if base_host and urlparse(url).netloc != base_host
     ]
 
@@ -797,13 +895,15 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
         if old_i in connected:
             old_to_new[old_i] = len(nodes_data_filtered)
             nodes_data_filtered.append(nd)
-    edges_data = [{"s": old_to_new[e["s"]], "t": old_to_new[e["t"]]} for e in edges_data]
+    edges_data = [
+        {"s": old_to_new[e["s"]], "t": old_to_new[e["t"]]} for e in edges_data
+    ]
     nodes_data = nodes_data_filtered
 
     # Explicitly mark the start node – safeguard against canonical mismatches after capping/filtering
     if start_canonical:
         for nd in nodes_data:
-            nd["isStart"] = (canonical_url(nd["url"]) == start_canonical)
+            nd["isStart"] = canonical_url(nd["url"]) == start_canonical
 
     nodes_json = json.dumps(nodes_data)
     edges_json = json.dumps(edges_data)
@@ -1221,6 +1321,7 @@ def _generate_topology_html(base_host: str, start_url: str = "") -> str:
 def generate_crawl_report_html(start_url: str, out_path: str):
     """Query the DB and write a self-contained HTML crawl report to *out_path*."""
     import datetime
+
     conn = get_db()
     base_host = urlparse(start_url).netloc if start_url else ""
 
@@ -1249,12 +1350,12 @@ def generate_crawl_report_html(start_url: str, out_path: str):
         elif status_code and status_code >= 400:
             pages_other_err.append((url, status_code))
         elif skip_reason.startswith("media:"):
-            ct = skip_reason[len("media:"):]
+            ct = skip_reason[len("media:") :]
             pages_media.append((url, ct))
         elif skip_reason.startswith("error:"):
-            pages_error.append((url, skip_reason[len("error:"):]))
+            pages_error.append((url, skip_reason[len("error:") :]))
         elif skip_reason.startswith("redirect:"):
-            target = skip_reason[len("redirect:"):]
+            target = skip_reason[len("redirect:") :]
             pages_redirect.append((url, target))
         elif visited:
             pages_ok.append(url)
@@ -1265,7 +1366,15 @@ def generate_crawl_report_html(start_url: str, out_path: str):
         if not base_host or urlparse(url).netloc == base_host:
             params_by_url.setdefault(url, []).append((param, value))
 
-    total_crawled = len(pages_ok) + len(pages_404) + len(pages_403) + len(pages_other_err) + len(pages_media) + len(pages_error) + len(pages_redirect)
+    total_crawled = (
+        len(pages_ok)
+        + len(pages_404)
+        + len(pages_403)
+        + len(pages_other_err)
+        + len(pages_media)
+        + len(pages_error)
+        + len(pages_redirect)
+    )
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # ── Build section items ────────────────────────────────────────────────
@@ -1273,12 +1382,24 @@ def generate_crawl_report_html(start_url: str, out_path: str):
         safe = _html_module.escape(u)
         return f'<a href="{safe}" target="_blank">{safe}</a>'
 
-    items_404   = [_url_link(u) for u in pages_404]
-    items_403   = [_url_link(u) for u in pages_403]
-    items_other = [f'<span class="tag red">HTTP {sc}</span>{_url_link(u)}' for u, sc in pages_other_err]
-    items_media = [f'<span class="tag muted">{_html_module.escape(ct)}</span>{_url_link(u)}' for u, ct in pages_media]
-    items_error    = [f'<span class="tag red">error</span>{_url_link(u)}<span class="param-row">{_html_module.escape(e[:120])}</span>' for u, e in pages_error]
-    items_redirect = [f'{_url_link(u)}<span class="param-row">↗ {_html_module.escape(t)}</span>' for u, t in pages_redirect]
+    items_404 = [_url_link(u) for u in pages_404]
+    items_403 = [_url_link(u) for u in pages_403]
+    items_other = [
+        f'<span class="tag red">HTTP {sc}</span>{_url_link(u)}'
+        for u, sc in pages_other_err
+    ]
+    items_media = [
+        f'<span class="tag muted">{_html_module.escape(ct)}</span>{_url_link(u)}'
+        for u, ct in pages_media
+    ]
+    items_error = [
+        f'<span class="tag red">error</span>{_url_link(u)}<span class="param-row">{_html_module.escape(e[:120])}</span>'
+        for u, e in pages_error
+    ]
+    items_redirect = [
+        f'{_url_link(u)}<span class="param-row">↗ {_html_module.escape(t)}</span>'
+        for u, t in pages_redirect
+    ]
 
     # Build external URL → list of internal pages that link to it
     can_to_url: dict[str, str] = {canonical_url(u): u for u, *_ in all_pages}
@@ -1288,7 +1409,11 @@ def generate_crawl_report_html(start_url: str, out_path: str):
         tgt_url = can_to_url.get(tgt_can)
         if not src_url or not tgt_url:
             continue
-        if base_host and urlparse(tgt_url).netloc != base_host and urlparse(src_url).netloc == base_host:
+        if (
+            base_host
+            and urlparse(tgt_url).netloc != base_host
+            and urlparse(src_url).netloc == base_host
+        ):
             refs = ext_referrers.setdefault(tgt_url, [])
             if src_url not in refs:
                 refs.append(src_url)
@@ -1303,18 +1428,20 @@ def generate_crawl_report_html(start_url: str, out_path: str):
             for r in sorted(refs)
         )
         n_refs = len(refs)
-        label = f'&#9656; linked from {n_refs} internal page{"s" if n_refs != 1 else ""}'
+        label = (
+            f"&#9656; linked from {n_refs} internal page{'s' if n_refs != 1 else ''}"
+        )
         return (
-            f'{link}'
+            f"{link}"
             f'<details style="margin-top:0.25rem;">'
             f'<summary style="font-size:0.78rem;color:var(--muted);padding:0.15rem 0;'
             f'list-style:none;cursor:pointer;user-select:none;">{label}</summary>'
             f'<ul style="list-style:none;padding:0.25rem 0 0 1.2rem;">{ref_rows}</ul>'
-            f'</details>'
+            f"</details>"
         )
 
-    items_ext      = [_ext_item(u) for u in sorted(set(pages_external))]
-    items_ok       = [_url_link(u) for u in pages_ok]
+    items_ext = [_ext_item(u) for u in sorted(set(pages_external))]
+    items_ok = [_url_link(u) for u in pages_ok]
 
     # GET param items: one collapsible entry per URL
     param_items = []
@@ -1327,32 +1454,47 @@ def generate_crawl_report_html(start_url: str, out_path: str):
 
     # ── Stat cards ─────────────────────────────────────────────────────────
     def _card(label: str, value, color: str = "blue") -> str:
-        return (f'<div class="stat-card"><div class="label">{label}</div>'
-                f'<div class="value {color}">{value}</div></div>')
+        return (
+            f'<div class="stat-card"><div class="label">{label}</div>'
+            f'<div class="value {color}">{value}</div></div>'
+        )
 
     stats = (
-        _card("Pages crawled", total_crawled, "blue") +
-        _card("404 errors", len(pages_404), "red" if pages_404 else "green") +
-        _card("403 forbidden", len(pages_403), "yellow" if pages_403 else "green") +
-        _card("Media skipped", len(pages_media), "muted") +
-        _card("Ext. redirects", len(pages_redirect), "yellow" if pages_redirect else "green") +
-        _card("External links", len(set(pages_external)), "blue") +
-        _card("URLs w/ params", len(params_by_url), "yellow" if params_by_url else "green")
+        _card("Pages crawled", total_crawled, "blue")
+        + _card("404 errors", len(pages_404), "red" if pages_404 else "green")
+        + _card("403 forbidden", len(pages_403), "yellow" if pages_403 else "green")
+        + _card("Media skipped", len(pages_media), "muted")
+        + _card(
+            "Ext. redirects",
+            len(pages_redirect),
+            "yellow" if pages_redirect else "green",
+        )
+        + _card("External links", len(set(pages_external)), "blue")
+        + _card(
+            "URLs w/ params", len(params_by_url), "yellow" if params_by_url else "green"
+        )
     )
 
     # ── Assemble HTML ──────────────────────────────────────────────────────
     topology_html = _generate_topology_html(base_host, start_url=start_url)
 
     sections = (
-        _html_section("🔴 404 Not Found", items_404, "red") +
-        _html_section("🟡 403 Forbidden", items_403, "yellow") +
-        _html_section("⚠️ Other HTTP Errors", items_other, "red") +
-        _html_section("🎞️ Media / Non-HTML (skipped)", items_media, "muted") +
-        _html_section("❌ Fetch Errors", items_error, "red") +
-        _html_section("↗️ Cross-subdomain Redirects (not crawled)", items_redirect, "yellow") +
-        _html_section("🔗 External Links", items_ext, "blue") +
-        _html_section("🔍 URLs with GET Parameters", param_items, "yellow", open_by_default=bool(param_items)) +
-        _html_section("✅ Successfully Crawled Pages", items_ok, "green")
+        _html_section("🔴 404 Not Found", items_404, "red")
+        + _html_section("🟡 403 Forbidden", items_403, "yellow")
+        + _html_section("⚠️ Other HTTP Errors", items_other, "red")
+        + _html_section("🎞️ Media / Non-HTML (skipped)", items_media, "muted")
+        + _html_section("❌ Fetch Errors", items_error, "red")
+        + _html_section(
+            "↗️ Cross-subdomain Redirects (not crawled)", items_redirect, "yellow"
+        )
+        + _html_section("🔗 External Links", items_ext, "blue")
+        + _html_section(
+            "🔍 URLs with GET Parameters",
+            param_items,
+            "yellow",
+            open_by_default=bool(param_items),
+        )
+        + _html_section("✅ Successfully Crawled Pages", items_ok, "green")
     )
 
     html = f"""<!DOCTYPE html>
@@ -1381,6 +1523,7 @@ def generate_crawl_report_html(start_url: str, out_path: str):
 # HTML XSS Report
 # ---------------------------------------------------------------------------
 
+
 def generate_xss_report_html(
     start_url: str,
     canary: str,
@@ -1390,10 +1533,11 @@ def generate_xss_report_html(
 ):
     """Write a self-contained HTML XSS report to *out_path*."""
     import datetime
+
     base_host = urlparse(start_url).netloc if start_url else ""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    exploitable  = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if ex]
+    exploitable = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if ex]
     filtered_ref = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if not ex]
 
     def _url_link(u: str) -> str:
@@ -1411,10 +1555,10 @@ def generate_xss_report_html(
             f'<div class="xss-block">'
             f'<span class="tag red">VULNERABLE</span>'
             f'<span class="tag yellow">param={_html_module.escape(p)}</span>'
-            f'&nbsp;[{_html_module.escape(l)}]'
+            f"&nbsp;[{_html_module.escape(l)}]"
             f'<div class="ctx">{_html_module.escape(d)}</div>'
             f'<div class="turl"><a href="{_html_module.escape(tu)}" target="_blank">Test URL</a>: {_html_module.escape(tu)}</div>'
-            f'</div>'
+            f"</div>"
             for p, l, d, tu in hits
         )
         refl_items.append(f"{_url_link(url)}{inner}")
@@ -1431,29 +1575,46 @@ def generate_xss_report_html(
 
     # Stat cards
     def _card(label: str, value, color: str = "blue") -> str:
-        return (f'<div class="stat-card"><div class="label">{label}</div>'
-                f'<div class="value {color}">{value}</div></div>')
+        return (
+            f'<div class="stat-card"><div class="label">{label}</div>'
+            f'<div class="value {color}">{value}</div></div>'
+        )
 
     total_vulns = len(exploitable) + len(stored_hits)
     stats = (
-        _card("Exploitable (Reflected)", len(exploitable), "red" if exploitable else "green") +
-        _card("Stored XSS", len(stored_hits), "red" if stored_hits else "green") +
-        _card("Filtered (Reflected)", len(filtered_ref), "yellow" if filtered_ref else "green") +
-        _card("Total Vulnerabilities", total_vulns, "red" if total_vulns else "green")
+        _card(
+            "Exploitable (Reflected)",
+            len(exploitable),
+            "red" if exploitable else "green",
+        )
+        + _card("Stored XSS", len(stored_hits), "red" if stored_hits else "green")
+        + _card(
+            "Filtered (Reflected)",
+            len(filtered_ref),
+            "yellow" if filtered_ref else "green",
+        )
+        + _card("Total Vulnerabilities", total_vulns, "red" if total_vulns else "green")
     )
 
     sections = (
-        _html_section("🔴 Exploitable Reflected XSS", refl_items, "red", open_by_default=bool(refl_items)) +
-        _html_section("💾 Stored XSS", stored_items, "red", open_by_default=bool(stored_items)) +
-        _html_section("🟡 Filtered / Encoded Reflections", filt_items, "yellow")
+        _html_section(
+            "🔴 Exploitable Reflected XSS",
+            refl_items,
+            "red",
+            open_by_default=bool(refl_items),
+        )
+        + _html_section(
+            "💾 Stored XSS", stored_items, "red", open_by_default=bool(stored_items)
+        )
+        + _html_section("🟡 Filtered / Encoded Reflections", filt_items, "yellow")
     )
 
     verdict = (
         f'<p style="color:var(--red);font-size:1.1rem;font-weight:bold;margin-bottom:1.5rem">'
-        f'⚠️ {total_vulns} exploitable vulnerability/ies found!</p>'
-        if total_vulns else
-        f'<p style="color:var(--green);font-size:1.1rem;font-weight:bold;margin-bottom:1.5rem">'
-        f'✅ No exploitable XSS vulnerabilities found.</p>'
+        f"⚠️ {total_vulns} exploitable vulnerability/ies found!</p>"
+        if total_vulns
+        else f'<p style="color:var(--green);font-size:1.1rem;font-weight:bold;margin-bottom:1.5rem">'
+        f"✅ No exploitable XSS vulnerabilities found.</p>"
     )
 
     html = f"""<!DOCTYPE html>
@@ -1483,25 +1644,29 @@ def print_findings(start_url: str = ""):
 
     base_host = urlparse(start_url).netloc if start_url else ""
 
-    total_pages = conn.execute("SELECT COUNT(*) FROM pages WHERE visited = 1").fetchone()[0]
+    total_pages = conn.execute(
+        "SELECT COUNT(*) FROM pages WHERE visited = 1"
+    ).fetchone()[0]
     finding_rows = conn.execute(
         "SELECT url, param, value FROM findings ORDER BY url, param"
     ).fetchall()
-    affected_urls = conn.execute(
-        "SELECT COUNT(DISTINCT url) FROM findings"
-    ).fetchone()[0]
+    affected_urls = conn.execute("SELECT COUNT(DISTINCT url) FROM findings").fetchone()[
+        0
+    ]
 
     # all visited pages for this base domain
     if base_host:
         visited_pages = [
-            row[0] for row in conn.execute(
+            row[0]
+            for row in conn.execute(
                 "SELECT url FROM pages WHERE visited = 1 ORDER BY url"
             ).fetchall()
             if urlparse(row[0]).netloc == base_host
         ]
     else:
         visited_pages = [
-            row[0] for row in conn.execute(
+            row[0]
+            for row in conn.execute(
                 "SELECT url FROM pages WHERE visited = 1 ORDER BY url"
             ).fetchall()
         ]
@@ -1544,7 +1709,9 @@ def _load_wordlist_samples(n: int = 2) -> list[str]:
     return [lines[min(i * step, len(lines) - 1)] for i in range(n)]
 
 
-def _check_reflection_context(html_text: str, canary: str, payload: str = "") -> list[tuple[str, bool]]:
+def _check_reflection_context(
+    html_text: str, canary: str, payload: str = ""
+) -> list[tuple[str, bool]]:
     """
     Analyse where/how *canary* appears in *html_text*.
     Returns list of (description, exploitable) tuples.
@@ -1556,37 +1723,52 @@ def _check_reflection_context(html_text: str, canary: str, payload: str = "") ->
     """
     results: list[tuple[str, bool]] = []
 
-    _html_special  = set('<>"\'')
-    _breakout_chars = set('<>"\'\x00')
-    _nav_attrs     = {"href", "src", "action", "formaction", "data"}
+    _html_special = set("<>\"'")
+    _breakout_chars = set("<>\"'\x00")
+    _nav_attrs = {"href", "src", "action", "formaction", "data"}
     payload_has_special = bool(payload and _html_special & set(payload))
-    payload_specials    = _html_special & set(payload) if payload else set()
+    payload_specials = _html_special & set(payload) if payload else set()
 
     # ── canary not in raw html at all ────────────────────────────────────────
     if canary not in html_text:
         if _html_module.escape(canary) in html_text:
-            results.append(("HTML-entity encoded – server escapes output (not exploitable)", False))
+            results.append(
+                ("HTML-entity encoded – server escapes output (not exploitable)", False)
+            )
         url_enc = canary.replace("<", "%3C").replace(">", "%3E").replace('"', "%22")
         if url_enc.lower() in html_text.lower():
-            results.append(("URL-encoded reflection – filtered (not exploitable)", False))
+            results.append(
+                ("URL-encoded reflection – filtered (not exploitable)", False)
+            )
         return results
 
     # ── canary present, but payload's special chars were encoded/stripped ────
     if payload_has_special and payload not in html_text:
-        esc_payload = _html_module.escape(payload)          # e.g. &lt;canary&gt;
-        url_payload = payload.replace("<", "%3C").replace(">", "%3E").replace('"', "%22")
+        esc_payload = _html_module.escape(payload)  # e.g. &lt;canary&gt;
+        url_payload = (
+            payload.replace("<", "%3C").replace(">", "%3E").replace('"', "%22")
+        )
         if esc_payload in html_text:
-            results.append(("HTML-entity encoded – &lt; &gt; escaped by server (not exploitable)", False))
+            results.append(
+                (
+                    "HTML-entity encoded – &lt; &gt; escaped by server (not exploitable)",
+                    False,
+                )
+            )
         elif url_payload.lower() in html_text.lower():
             results.append(("URL-encoded – %3C %3E present (not exploitable)", False))
         else:
             # Check each special char individually
             all_encoded = all(
-                _html_module.escape(c) in html_text or c.replace("<", "%3C").replace(">", "%3E") in html_text
+                _html_module.escape(c) in html_text
+                or c.replace("<", "%3C").replace(">", "%3E") in html_text
                 for c in payload_specials
             )
-            msg = ("special chars entity/URL-encoded by server (not exploitable)" if all_encoded
-                   else "special chars stripped or mangled by server (not exploitable)")
+            msg = (
+                "special chars entity/URL-encoded by server (not exploitable)"
+                if all_encoded
+                else "special chars stripped or mangled by server (not exploitable)"
+            )
             results.append((msg, False))
         return results
 
@@ -1635,7 +1817,12 @@ def _check_reflection_context(html_text: str, canary: str, payload: str = "") ->
 
             if attr_l.startswith("on"):
                 if _canary_literally_in_raw(tag):
-                    results.append((f"in event attribute <{tag.name} {attr}=> – JS execution likely", True))
+                    results.append(
+                        (
+                            f"in event attribute <{tag.name} {attr}=> – JS execution likely",
+                            True,
+                        )
+                    )
                     found_specific = True
 
             elif attr_l in _nav_attrs:
@@ -1643,12 +1830,27 @@ def _check_reflection_context(html_text: str, canary: str, payload: str = "") ->
                     can_breakout = bool(payload and _breakout_chars & set(payload))
                     is_js = v.lstrip().lower().startswith("javascript:")
                     if can_breakout or is_js:
-                        results.append((f"in navigation attribute <{tag.name} {attr}=> – breakout possible", True))
+                        results.append(
+                            (
+                                f"in navigation attribute <{tag.name} {attr}=> – breakout possible",
+                                True,
+                            )
+                        )
                     else:
-                        results.append((f"reflected in <{tag.name} {attr}=> (no breakout chars – informational)", False))
+                        results.append(
+                            (
+                                f"reflected in <{tag.name} {attr}=> (no breakout chars – informational)",
+                                False,
+                            )
+                        )
                     found_specific = True
                 else:
-                    results.append((f"entity/URL-encoded in <{tag.name} {attr}=> – filtered (not exploitable)", False))
+                    results.append(
+                        (
+                            f"entity/URL-encoded in <{tag.name} {attr}=> – filtered (not exploitable)",
+                            False,
+                        )
+                    )
                     found_specific = True
 
             else:
@@ -1665,11 +1867,13 @@ def _check_reflection_context(html_text: str, canary: str, payload: str = "") ->
         if injected is not None and f"<{canary}" in html_text:
             # Server did NOT escape <  – HTML injection confirmed.
             # Not directly executable by itself, but < > are unfiltered.
-            results.append((
-                f"HTML tag injected – <{canary}> element created in DOM – "
-                "< not filtered (HTML injection, not directly executable)",
-                True,
-            ))
+            results.append(
+                (
+                    f"HTML tag injected – <{canary}> element created in DOM – "
+                    "< not filtered (HTML injection, not directly executable)",
+                    True,
+                )
+            )
             found_specific = True
 
     # 4. Fallback: canary somewhere in raw html but no specific context found
@@ -1711,7 +1915,12 @@ def _check_xss_context(html_text: str, payload: str) -> list[tuple[str, bool]]:
     # event handler attributes
     for ev in ("onerror", "onload", "onclick", "onmouseover", "onfocus"):
         if f"{ev}=" in pl and f"{ev}=" in html_text.lower():
-            return [(f"event handler ({ev}=) reflected unescaped – JS execution likely", True)]
+            return [
+                (
+                    f"event handler ({ev}=) reflected unescaped – JS execution likely",
+                    True,
+                )
+            ]
 
     # javascript: URI
     if "javascript:" in pl and "javascript:" in html_text.lower():
@@ -1719,7 +1928,12 @@ def _check_xss_context(html_text: str, payload: str) -> list[tuple[str, bool]]:
 
     # < and > are unescaped but no obviously executable pattern
     if "<" in payload and "<" in html_text:
-        return [("HTML tag reflected unescaped (< not filtered) – potential HTML injection", True)]
+        return [
+            (
+                "HTML tag reflected unescaped (< not filtered) – potential HTML injection",
+                True,
+            )
+        ]
 
     return [("verbatim reflection – no executable pattern detected", False)]
 
@@ -1737,11 +1951,11 @@ def run_advanced_scan(url: str, param: str | None = None):
     canary = "xsstest" + "".join(random.choices(string.ascii_lowercase, k=6))
 
     built_in_payloads: list[tuple[str, str]] = [
-        (canary,                                                    "1-raw canary"),
-        (f"<{canary}>",                                             "2-HTML tag"),
-        (f"<script>alert('{canary}')</script>",                     "3-script tag"),
-        (f'"><img src=x onerror=alert(\'{canary}\')>',              "4-attribute breakout"),
-        (f"';alert('{canary}');//",                                 "5-JS string breakout"),
+        (canary, "1-raw canary"),
+        (f"<{canary}>", "2-HTML tag"),
+        (f"<script>alert('{canary}')</script>", "3-script tag"),
+        (f"\"><img src=x onerror=alert('{canary}')>", "4-attribute breakout"),
+        (f"';alert('{canary}');//", "5-JS string breakout"),
     ]
 
     # Load ALL wordlist payloads
@@ -1750,7 +1964,11 @@ def run_advanced_scan(url: str, param: str | None = None):
         with open(XSS_WORDLIST, encoding="utf-8", errors="ignore") as f:
             wordlist_payloads = [ln.strip() for ln in f if ln.strip()]
     except FileNotFoundError:
-        print(C.yellow(f"[WARNING] Wordlist {XSS_WORDLIST} not found – only built-in payloads will be used"))
+        print(
+            C.yellow(
+                f"[WARNING] Wordlist {XSS_WORDLIST} not found – only built-in payloads will be used"
+            )
+        )
 
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
@@ -1762,16 +1980,24 @@ def run_advanced_scan(url: str, param: str | None = None):
     # Which parameters to test
     if param:
         if param not in params:
-            print(C.yellow(f"[WARNING] Parameter '{param}' not in URL; testing all params: {list(params.keys())}"))
+            print(
+                C.yellow(
+                    f"[WARNING] Parameter '{param}' not in URL; testing all params: {list(params.keys())}"
+                )
+            )
             test_params_list = list(params.keys())
         else:
             test_params_list = [param]
     else:
         test_params_list = list(params.keys())
 
-    HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
+    }
     AUTH = _HTTP_AUTH
-    total_tests = (len(built_in_payloads) + len(wordlist_payloads)) * len(test_params_list)
+    total_tests = (len(built_in_payloads) + len(wordlist_payloads)) * len(
+        test_params_list
+    )
 
     sep = C.bold("=" * 60)
     print(f"\n{sep}")
@@ -1798,26 +2024,42 @@ def run_advanced_scan(url: str, param: str | None = None):
                 test_p[test_param] = payload
                 test_url = parsed._replace(query=urlencode(test_p)).geturl()
                 try:
-                    resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
-                                        headers=HEADERS, auth=AUTH, allow_redirects=True)
+                    resp = requests.get(
+                        test_url,
+                        timeout=10,
+                        verify=CA_BUNDLE,
+                        headers=HEADERS,
+                        auth=AUTH,
+                        allow_redirects=True,
+                    )
                     contexts = _check_reflection_context(resp.text, canary, payload)
                     if not contexts:
                         print(C.green("  [safe]") + f" [{label}]")
                     else:
                         for desc, exploitable in contexts:
-                            icon = C.red("[VULNERABLE]") if exploitable else C.yellow("[FILTERED]")
+                            icon = (
+                                C.red("[VULNERABLE]")
+                                if exploitable
+                                else C.yellow("[FILTERED]")
+                            )
                             print(f"  {icon} [{label}]")
                             print(f"    Context  : {desc}")
                             print(f"    Payload  : {payload[:120]}")
                             if exploitable:
                                 print(f"    Test URL : {C.magenta(test_url)}")
-                            all_hits.append((test_param, label, exploitable, desc, test_url))
+                            all_hits.append(
+                                (test_param, label, exploitable, desc, test_url)
+                            )
                 except Exception as exc:
                     print(C.red("  [ERROR]") + f" [{label}] {exc}")
 
             # ── wordlist payloads ─────────────────────────────────────────────
             if wordlist_payloads:
-                print(C.bold(f"  Running {len(wordlist_payloads)} wordlist payloads … (press Ctrl-C to stop early)"))
+                print(
+                    C.bold(
+                        f"  Running {len(wordlist_payloads)} wordlist payloads … (press Ctrl-C to stop early)"
+                    )
+                )
             vuln_count = 0
             safe_count = 0
             for i, payload in enumerate(wordlist_payloads, 1):
@@ -1825,31 +2067,54 @@ def run_advanced_scan(url: str, param: str | None = None):
                 test_p[test_param] = payload
                 test_url = parsed._replace(query=urlencode(test_p)).geturl()
                 try:
-                    resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
-                                        headers=HEADERS, auth=AUTH, allow_redirects=True)
+                    resp = requests.get(
+                        test_url,
+                        timeout=10,
+                        verify=CA_BUNDLE,
+                        headers=HEADERS,
+                        auth=AUTH,
+                        allow_redirects=True,
+                    )
                     if payload in resp.text:
                         contexts = _check_xss_context(resp.text, payload)
                         for desc, exploitable in contexts:
-                            icon = C.red("[VULNERABLE]") if exploitable else C.yellow("[REFLECTED]")
+                            icon = (
+                                C.red("[VULNERABLE]")
+                                if exploitable
+                                else C.yellow("[REFLECTED]")
+                            )
                             print(f"  {icon} [wordlist #{i}] {payload[:70]}")
                             print(f"    Context  : {desc}")
                             if exploitable:
                                 print(f"    Test URL : {C.magenta(test_url)}")
-                            all_hits.append((test_param, f"wordlist#{i}", exploitable, desc, test_url))
+                            all_hits.append(
+                                (
+                                    test_param,
+                                    f"wordlist#{i}",
+                                    exploitable,
+                                    desc,
+                                    test_url,
+                                )
+                            )
                             vuln_count += 1
                     else:
                         safe_count += 1
                 except Exception as exc:
                     print(C.red("  [ERROR]") + f" [wordlist #{i}] {exc}")
             if wordlist_payloads:
-                print(f"  [wordlist done] {C.red(str(vuln_count))} reflected, {C.green(str(safe_count))} safe")
+                print(
+                    f"  [wordlist done] {C.red(str(vuln_count))} reflected, {C.green(str(safe_count))} safe"
+                )
 
     except KeyboardInterrupt:
-        print(C.yellow("\n\n[INTERRUPTED]") + " Advanced scan stopped by user. Printing partial report…")
+        print(
+            C.yellow("\n\n[INTERRUPTED]")
+            + " Advanced scan stopped by user. Printing partial report…"
+        )
 
     # ── Report ────────────────────────────────────────────────────────────────
     exploitable = [(p, l, d, tu) for p, l, ex, d, tu in all_hits if ex]
-    filtered    = [(p, l, d, tu) for p, l, ex, d, tu in all_hits if not ex]
+    filtered = [(p, l, d, tu) for p, l, ex, d, tu in all_hits if not ex]
 
     print(f"\n{sep}")
     print(C.bold("ADVANCED XSS SCAN REPORT"))
@@ -1860,7 +2125,9 @@ def run_advanced_scan(url: str, param: str | None = None):
         print(C.green("  No XSS reflections detected."))
     else:
         if exploitable:
-            print(C.red(C.bold(f"  {len(exploitable)} EXPLOITABLE reflection(s) found!")))
+            print(
+                C.red(C.bold(f"  {len(exploitable)} EXPLOITABLE reflection(s) found!"))
+            )
             for prm, label, desc, test_url in exploitable:
                 print(f"    {C.red('VULNERABLE')} param={C.yellow(prm)} [{label}]")
                 print(f"      Context  : {desc}")
@@ -1868,7 +2135,11 @@ def run_advanced_scan(url: str, param: str | None = None):
         else:
             print(C.green("  No exploitable XSS found."))
         if filtered:
-            print(C.yellow(f"\n  {len(filtered)} filtered/encoded reflection(s) – output is escaped:"))
+            print(
+                C.yellow(
+                    f"\n  {len(filtered)} filtered/encoded reflection(s) – output is escaped:"
+                )
+            )
             for prm, label, desc, _ in filtered:
                 print(f"    param={prm} [{label}] – {desc}")
     print()
@@ -1882,11 +2153,11 @@ def run_xss_scan(start_url: str):
 
     # 5 payloads of increasing sophistication, all embed the canary
     built_in_payloads: list[tuple[str, str]] = [
-        (canary,                                                    "1-raw canary"),
-        (f"<{canary}>",                                             "2-HTML tag"),
-        (f"<script>alert('{canary}')</script>",                     "3-script tag"),
-        (f'"><img src=x onerror=alert(\'{canary}\')>',              "4-attribute breakout"),
-        (f"';alert('{canary}');//",                                 "5-JS string breakout"),
+        (canary, "1-raw canary"),
+        (f"<{canary}>", "2-HTML tag"),
+        (f"<script>alert('{canary}')</script>", "3-script tag"),
+        (f"\"><img src=x onerror=alert('{canary}')>", "4-attribute breakout"),
+        (f"';alert('{canary}');//", "5-JS string breakout"),
     ]
     # Augment with 2 raw wordlist payloads (no canary – verbatim tests)
     wordlist_extras = _load_wordlist_samples(2)
@@ -1900,7 +2171,8 @@ def run_xss_scan(start_url: str):
 
     # All visited pages (for stored XSS check)
     all_visited = [
-        r[0] for r in conn.execute(
+        r[0]
+        for r in conn.execute(
             "SELECT url FROM pages WHERE visited = 1 ORDER BY url"
         ).fetchall()
         if urlparse(r[0]).netloc == base_host
@@ -1922,14 +2194,18 @@ def run_xss_scan(start_url: str):
     for _, label in built_in_payloads:
         print(f"    [{label}]")
     if wordlist_extras:
-        print(f"  Wordlist payloads ({len(wordlist_extras)}): verbatim from {XSS_WORDLIST}")
+        print(
+            f"  Wordlist payloads ({len(wordlist_extras)}): verbatim from {XSS_WORDLIST}"
+        )
     print()
 
     # (base_url, param, label, desc, exploitable, test_url)
     reflected_hits: list[tuple[str, str, str, str, bool, str]] = []
-    stored_hits:   list[str] = []          # pages where canary was found after injection
+    stored_hits: list[str] = []  # pages where canary was found after injection
 
-    HEADERS = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"}
+    HEADERS = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"
+    }
     AUTH = _HTTP_AUTH
 
     try:
@@ -1952,23 +2228,37 @@ def run_xss_scan(start_url: str):
                     test_url = parsed._replace(query=urlencode(test_params)).geturl()
 
                     try:
-                        resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
-                                            headers=HEADERS, auth=AUTH, allow_redirects=True)
+                        resp = requests.get(
+                            test_url,
+                            timeout=10,
+                            verify=CA_BUNDLE,
+                            headers=HEADERS,
+                            auth=AUTH,
+                            allow_redirects=True,
+                        )
                         contexts = _check_reflection_context(resp.text, canary, payload)
 
                         if not contexts:
                             print(C.green("  [safe]") + f" param={param} [{label}]")
                         else:
                             for desc, exploitable in contexts:
-                                icon = C.red("[VULNERABLE]") if exploitable else C.yellow("[FILTERED]")
+                                icon = (
+                                    C.red("[VULNERABLE]")
+                                    if exploitable
+                                    else C.yellow("[FILTERED]")
+                                )
                                 print(f"  {icon} param={C.yellow(param)} [{label}]")
                                 print(f"    Context  : {desc}")
                                 if exploitable:
                                     print(f"    Test URL : {C.magenta(test_url)}")
-                                    reflected_hits.append((base_url, param, label, desc, True, test_url))
+                                    reflected_hits.append(
+                                        (base_url, param, label, desc, True, test_url)
+                                    )
                                     param_hit = True
                                 else:
-                                    reflected_hits.append((base_url, param, label, desc, False, test_url))
+                                    reflected_hits.append(
+                                        (base_url, param, label, desc, False, test_url)
+                                    )
                     except Exception as exc:
                         print(C.red("  [ERROR]") + f" {exc}")
 
@@ -1980,21 +2270,49 @@ def run_xss_scan(start_url: str):
                     test_params[param] = payload
                     test_url = parsed._replace(query=urlencode(test_params)).geturl()
                     try:
-                        resp = requests.get(test_url, timeout=10, verify=CA_BUNDLE,
-                                            headers=HEADERS, auth=AUTH, allow_redirects=True)
+                        resp = requests.get(
+                            test_url,
+                            timeout=10,
+                            verify=CA_BUNDLE,
+                            headers=HEADERS,
+                            auth=AUTH,
+                            allow_redirects=True,
+                        )
                         if payload in resp.text:
                             contexts = _check_xss_context(resp.text, payload)
                             for desc, exploitable in contexts:
-                                icon = C.red("[VULNERABLE]") if exploitable else C.yellow("[REFLECTED]")
+                                icon = (
+                                    C.red("[VULNERABLE]")
+                                    if exploitable
+                                    else C.yellow("[REFLECTED]")
+                                )
                                 print(f"  {icon} param={C.yellow(param)} [wordlist]")
                                 print(f"    Payload  : {payload[:80]}")
                                 print(f"    Context  : {desc}")
                                 if exploitable:
                                     print(f"    Test URL : {C.magenta(test_url)}")
-                                    reflected_hits.append((base_url, param, "wordlist", desc, True, test_url))
+                                    reflected_hits.append(
+                                        (
+                                            base_url,
+                                            param,
+                                            "wordlist",
+                                            desc,
+                                            True,
+                                            test_url,
+                                        )
+                                    )
                                     param_hit = True
                                 else:
-                                    reflected_hits.append((base_url, param, "wordlist", desc, False, test_url))
+                                    reflected_hits.append(
+                                        (
+                                            base_url,
+                                            param,
+                                            "wordlist",
+                                            desc,
+                                            False,
+                                            test_url,
+                                        )
+                                    )
                         else:
                             print(C.green("  [safe]") + f" param={param} [wordlist]")
                     except Exception as exc:
@@ -2002,15 +2320,29 @@ def run_xss_scan(start_url: str):
 
         # ── Phase 2: Stored XSS ──────────────────────────────────────────────
         print()
-        print(C.bold(f"--- Phase 2: Stored XSS (checking {len(all_visited)} visited pages for canary) ---"))
+        print(
+            C.bold(
+                f"--- Phase 2: Stored XSS (checking {len(all_visited)} visited pages for canary) ---"
+            )
+        )
         for page_url in all_visited:
             try:
-                resp = requests.get(page_url, timeout=10, verify=CA_BUNDLE,
-                                    headers=HEADERS, auth=AUTH, allow_redirects=True)
+                resp = requests.get(
+                    page_url,
+                    timeout=10,
+                    verify=CA_BUNDLE,
+                    headers=HEADERS,
+                    auth=AUTH,
+                    allow_redirects=True,
+                )
                 if canary in resp.text:
                     contexts = _check_reflection_context(resp.text, canary, canary)
                     for desc, exploitable in contexts:
-                        icon = C.red("[STORED XSS]") if exploitable else C.yellow("[STORED/FILTERED]")
+                        icon = (
+                            C.red("[STORED XSS]")
+                            if exploitable
+                            else C.yellow("[STORED/FILTERED]")
+                        )
                         print(f"  {icon} {C.cyan(page_url)}")
                         print(f"    Context : {desc}")
                     stored_hits.append(page_url)
@@ -2020,11 +2352,14 @@ def run_xss_scan(start_url: str):
                 print(C.red("  [ERROR]") + f" {page_url}: {exc}")
 
     except KeyboardInterrupt:
-        print(C.yellow("\n\n[INTERRUPTED]") + " XSS scan stopped by user. Printing partial report…")
+        print(
+            C.yellow("\n\n[INTERRUPTED]")
+            + " XSS scan stopped by user. Printing partial report…"
+        )
 
     # ── Report ───────────────────────────────────────────────────────────────
     exploitable = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if ex]
-    filtered    = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if not ex]
+    filtered = [(u, p, l, d, tu) for u, p, l, d, ex, tu in reflected_hits if not ex]
 
     print(f"\n{sep}")
     print(C.bold("XSS SCAN REPORT"))
@@ -2043,12 +2378,20 @@ def run_xss_scan(start_url: str):
                 if url not in shown:
                     print(f"    {C.cyan(url)}")
                     shown.add(url)
-                print(f"      " + C.red("VULNERABLE") + f" param={C.yellow(param)} [{label}]")
+                print(
+                    f"      "
+                    + C.red("VULNERABLE")
+                    + f" param={C.yellow(param)} [{label}]"
+                )
                 print(f"      Context  : {desc}")
                 print(f"      Test URL : {C.magenta(test_url)}")
             print()
         if filtered:
-            print(C.yellow(f"  {len(filtered)} filtered/encoded reflection(s) – output is escaped:"))
+            print(
+                C.yellow(
+                    f"  {len(filtered)} filtered/encoded reflection(s) – output is escaped:"
+                )
+            )
             for url, param, label, desc, test_url in filtered:
                 print(f"    param={param} [{label}] – {desc}")
 
@@ -2057,7 +2400,11 @@ def run_xss_scan(start_url: str):
     if not stored_hits:
         print(C.green("  No stored XSS detected."))
     else:
-        print(C.red(C.bold(f"  Canary found on {len(stored_hits)} page(s) after injection!")))
+        print(
+            C.red(
+                C.bold(f"  Canary found on {len(stored_hits)} page(s) after injection!")
+            )
+        )
         for page_url in stored_hits:
             print(f"    {C.cyan(page_url)}")
     print()
@@ -2070,13 +2417,19 @@ def run_xss_scan(start_url: str):
     if total_vulns == 0:
         print(C.green(C.bold("  SUMMARY: No exploitable XSS vulnerabilities found.")))
     else:
-        print(C.red(C.bold(f"  SUMMARY: {total_vulns} EXPLOITABLE VULNERABILITY/IES FOUND")))
+        print(
+            C.red(
+                C.bold(f"  SUMMARY: {total_vulns} EXPLOITABLE VULNERABILITY/IES FOUND")
+            )
+        )
         print()
         idx = 1
         if exploitable:
             print(C.bold("  Reflected XSS:"))
             for url, param, label, desc, test_url in exploitable:
-                print(f"    {idx}. {C.red('REFLECTED')}  param={C.yellow(param)}  [{label}]")
+                print(
+                    f"    {idx}. {C.red('REFLECTED')}  param={C.yellow(param)}  [{label}]"
+                )
                 print(f"       Context  : {desc}")
                 print(f"       Test URL : {C.magenta(test_url)}")
                 idx += 1
@@ -2097,6 +2450,7 @@ def run_xss_scan(start_url: str):
 # Helper: recrawl (reset DB for domain, then crawl)
 # ---------------------------------------------------------------------------
 
+
 def recrawl(start_url: str, stay_on_domain: bool = True, workers: int = 1):
     """Delete all DB entries belonging to start_url's domain, then re-crawl.
 
@@ -2112,9 +2466,9 @@ def recrawl(start_url: str, stay_on_domain: bool = True, workers: int = 1):
 
     all_pages = conn.execute("SELECT id, url, referer FROM pages").fetchall()
     ids_to_delete = [
-        pid for pid, url, referer in all_pages
-        if urlparse(url).netloc == base_host
-        or urlparse(referer).netloc == base_host
+        pid
+        for pid, url, referer in all_pages
+        if urlparse(url).netloc == base_host or urlparse(referer).netloc == base_host
     ]
 
     if ids_to_delete:
@@ -2130,12 +2484,17 @@ def recrawl(start_url: str, stay_on_domain: bool = True, workers: int = 1):
 
     # Links: canonical URLs contain the full netloc so LIKE is safe here
     pattern = f"%{base_host}%"
-    conn.execute("DELETE FROM links WHERE source LIKE ? OR target LIKE ?", (pattern, pattern))
+    conn.execute(
+        "DELETE FROM links WHERE source LIKE ? OR target LIKE ?", (pattern, pattern)
+    )
 
     conn.commit()
     conn.close()
 
-    print(C.yellow(f"[RECRAWL]") + f" Deleted {len(ids_to_delete)} pages for {C.cyan(base_host)}")
+    print(
+        C.yellow(f"[RECRAWL]")
+        + f" Deleted {len(ids_to_delete)} pages for {C.cyan(base_host)}"
+    )
     crawl(start_url, stay_on_domain=stay_on_domain, workers=workers)
 
 
@@ -2143,32 +2502,33 @@ def recrawl(start_url: str, stay_on_domain: bool = True, workers: int = 1):
 # Help
 # ---------------------------------------------------------------------------
 
+
 def show_help():
     prog = os.path.basename(sys.argv[0])
     print(f"""
-{C.bold('Usage:')}
-  python {prog} {C.cyan('<start_url>')} [options]
+{C.bold("Usage:")}
+  python {prog} {C.cyan("<start_url>")} [options]
 
-{C.bold('Options:')}
-  {C.cyan('(none)')}              Crawl start_url, stay on same domain
-  {C.cyan('--all-domains')}       Follow links to other domains too
-  {C.cyan('--workers N')}         Fetch N pages in parallel (default: 1)
-  {C.cyan('--ignore PATTERN')}    Skip URLs matching PATTERN (substring or glob, repeatable)
-  {C.cyan('--recrawl')}           Reset DB for start_url's domain and re-crawl
-  {C.cyan('--xss')}               Run reflected/stored XSS tests on stored URLs
-  {C.cyan('--advancedscan URL')}  Run ALL xss.txt payloads on URL (+ optional param name)
-  {C.cyan('--user USER')}         HTTP Basic Auth username (for htaccess-protected sites)
-  {C.cyan('--password PASS')}     HTTP Basic Auth password (blank to prompt securely), needs to be last argument
-  {C.cyan('--help')}              Show this help
+{C.bold("Options:")}
+  {C.cyan("(none)")}              Crawl start_url, stay on same domain
+  {C.cyan("--all-domains")}       Follow links to other domains too
+  {C.cyan("--workers N")}         Fetch N pages in parallel (default: 1)
+  {C.cyan("--ignore PATTERN")}    Skip URLs matching PATTERN (substring or glob, repeatable)
+  {C.cyan("--recrawl")}           Reset DB for start_url's domain and re-crawl
+  {C.cyan("--xss")}               Run reflected/stored XSS tests on stored URLs
+  {C.cyan("--advancedscan URL")}  Run ALL xss.txt payloads on URL (+ optional param name)
+  {C.cyan("--user USER")}         HTTP Basic Auth username (for htaccess-protected sites)
+  {C.cyan("--password PASS")}     HTTP Basic Auth password (blank to prompt securely), needs to be last argument
+  {C.cyan("--help")}              Show this help
 
-{C.bold('--ignore examples:')}
+{C.bold("--ignore examples:")}
   --ignore /logout              skip any URL containing /logout
   --ignore "*/admin/*"          skip URLs matching glob pattern
   --ignore param:action         skip any URL with a query param named "action"
   --ignore param:id             skip any URL with a query param named "id"
   --ignore /print --ignore /rss multiple patterns supported
 
-{C.bold('Examples:')}
+{C.bold("Examples:")}
   python {prog} https://example.com
   python {prog} https://example.com --workers 5
   python {prog} https://example.com --ignore /logout --ignore /print
@@ -2187,7 +2547,6 @@ def show_help():
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-
 
     # Help
     if "--help" in args or "-h" in args or not args:
@@ -2211,6 +2570,7 @@ if __name__ == "__main__":
 
     # Parse --user / --password for HTTP Basic Auth
     import getpass
+
     http_user: str | None = None
     http_password: str | None = None
     for i, a in enumerate(args):
@@ -2224,7 +2584,9 @@ if __name__ == "__main__":
         _HTTP_AUTH = (http_user, http_password)
         print(C.yellow(f"[AUTH]") + f" HTTP Basic Auth enabled for user '{http_user}'")
     elif http_user is not None or http_password is not None:
-        print(C.red("[ERROR]") + " Both --user and --password must be provided together")
+        print(
+            C.red("[ERROR]") + " Both --user and --password must be provided together"
+        )
         sys.exit(1)
 
     # Parse --ignore PATTERN (repeatable)
@@ -2236,7 +2598,7 @@ if __name__ == "__main__":
         _IGNORE_PATTERNS.extend(ignore_patterns)  # shared directly with worker threads
         print(C.yellow(f"[IGNORE]") + f" Active patterns: {ignore_patterns}")
 
-    # Parse --workers N  or  --workers=N
+    # Parse --workers N
     workers = 1
     for _a in args:
         if _a == "--workers":
@@ -2244,13 +2606,6 @@ if __name__ == "__main__":
             try:
                 workers = max(1, int(args[_idx + 1]))
             except (IndexError, ValueError):
-                print(C.red("[ERROR]") + " --workers requires an integer argument")
-                sys.exit(1)
-            break
-        if _a.startswith("--workers="):
-            try:
-                workers = max(1, int(_a.split("=", 1)[1]))
-            except ValueError:
                 print(C.red("[ERROR]") + " --workers requires an integer argument")
                 sys.exit(1)
             break
@@ -2268,7 +2623,9 @@ if __name__ == "__main__":
                 adv_url = _next
                 # Optional param name immediately after the URL
                 _after = args[adv_idx + 2] if adv_idx + 2 < len(args) else ""
-                adv_param: str | None = _after if _after and not _after.startswith("--") else None
+                adv_param: str | None = (
+                    _after if _after and not _after.startswith("--") else None
+                )
             else:
                 # URL given as the positional start arg; treat _next as param name
                 adv_url = start
@@ -2279,3 +2636,4 @@ if __name__ == "__main__":
     finally:
         sys.stdout = sys.__stdout__
         tee.close()
+
