@@ -618,13 +618,16 @@ def crawl(
 
     site = urlparse(start_url).netloc
     dashboard = Dashboard(site)
+    pattern = f"%{site}%"
 
     def _get_stats() -> tuple[int, int]:
         """Return (scanned, total) from the DB under the lock."""
         with _db_lock:
-            total = conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
+            total = conn.execute(
+                f"SELECT COUNT(*) FROM pages WHERE url like '{pattern}' "
+            ).fetchone()[0]
             scanned = conn.execute(
-                "SELECT COUNT(*) FROM pages WHERE visited = 1"
+                f"SELECT COUNT(*) FROM pages WHERE visited = 1 AND url like '{pattern}'"
             ).fetchone()[0]
         return scanned, total
 
@@ -2463,38 +2466,32 @@ def recrawl(start_url: str, stay_on_domain: bool = True, workers: int = 1):
     """
     conn = get_db()
     base_host = urlparse(start_url).netloc
-
-    all_pages = conn.execute("SELECT id, url, referer FROM pages").fetchall()
-    ids_to_delete = [
-        pid
-        for pid, url, referer in all_pages
-        if urlparse(url).netloc == base_host or urlparse(referer).netloc == base_host
-    ]
-
-    if ids_to_delete:
-        ph = ",".join("?" * len(ids_to_delete))
-        conn.execute(f"DELETE FROM pages WHERE id IN ({ph})", ids_to_delete)
+    pattern = f"%{base_host}%"
+    all_pages = conn.execute(
+        f"SELECT id, url, referer FROM pages WHERE url like '{pattern}' "
+    ).fetchall()
+    count = 0
+    for id, url, referer in all_pages:
+        conn.execute("DELETE FROM pages WHERE id = ?", (id,))
+        count += 1
 
     # Findings: keyed by URL, filter by domain
-    all_findings = conn.execute("SELECT id, url FROM findings").fetchall()
-    fids = [fid for fid, url in all_findings if urlparse(url).netloc == base_host]
-    if fids:
-        ph = ",".join("?" * len(fids))
-        conn.execute(f"DELETE FROM findings WHERE id IN ({ph})", fids)
+    all_findings = conn.execute(
+        f"SELECT id, url FROM findings WHERE url like '{pattern}'"
+    ).fetchall()
+    for id, url in all_findings:
+        conn.execute("DELETE FROM findings WHERE id = ?", (id,))
+        count += 1
 
     # Links: canonical URLs contain the full netloc so LIKE is safe here
-    pattern = f"%{base_host}%"
     conn.execute(
-        "DELETE FROM links WHERE source LIKE ? OR target LIKE ?", (pattern, pattern)
+        f"DELETE FROM links WHERE source LIKE '{pattern}' OR target LIKE '{pattern}'"
     )
 
     conn.commit()
     conn.close()
 
-    print(
-        C.yellow(f"[RECRAWL]")
-        + f" Deleted {len(ids_to_delete)} pages for {C.cyan(base_host)}"
-    )
+    print(C.yellow(f"[RECRAWL]") + f" Deleted {count} pages for {C.cyan(base_host)}")
     crawl(start_url, stay_on_domain=stay_on_domain, workers=workers)
 
 
@@ -2636,4 +2633,3 @@ if __name__ == "__main__":
     finally:
         sys.stdout = sys.__stdout__
         tee.close()
-
